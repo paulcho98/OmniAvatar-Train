@@ -33,7 +33,7 @@ OmniAvatar/                          # Root
 │   ├── models/
 │   │   ├── wan_video_dit.py         # DiT model — core changes here
 │   │   ├── wan_video_text_encoder.py  # T5 text encoder (unchanged from Wan 2.1)
-│   │   ├── wan_video_vae.py         # Video VAE (unchanged from Wan 2.1)
+│   │   ├── wan_video_vae.py         # Video VAE (+ gradient checkpointing for aux losses)
 │   │   ├── audio_pack.py            # AudioPack module (NEW)
 │   │   ├── wav2vec.py               # Wav2Vec2 audio encoder (NEW)
 │   │   └── model_manager.py         # Model loading + smart_load_weights
@@ -59,6 +59,11 @@ OmniAvatar/                          # Root
 ├── examples/                        # Sample input files
 └── docs/                            # Reference documentation
 ```
+
+## Training Data
+
+- **Base path**: `/home/work/.local/combined_data/high_visual_quality` (NOT `/home/work/combined_data/`)
+- **Metadata**: `test_metadata.csv` (3 test samples for smoke tests)
 
 ## Running Training
 
@@ -162,6 +167,22 @@ Detailed documentation for training code reconstruction:
    providing `model_config: {in_dim: 33}`, `train_architecture: lora`, `lora_rank: 128`,
    `lora_alpha: 64`, `use_audio: true`, `i2v: true`, `random_prefix_frames: true`, etc.
 
+## Condition Dropout & Auxiliary Losses (train.py)
+
+**Condition dropout**: `--text_drop_prob 0.1 --audio_drop_prob 0.1` — randomly replaces
+text with empty encoding or audio with zeros during training for CFG support.
+
+**Auxiliary losses** on VAE-decoded x_0 predictions (each independently enabled):
+- `--use_sync_loss`: StableSyncNet chunked cosine-similarity BCE (lower half, 16-frame chunks)
+- `--use_lpips_loss`: VGG LPIPS perceptual loss (lower half)
+- `--use_trepa_loss`: VideoMAE-ViT-G temporal feature matching
+- `--use_vae_gradient_checkpointing`: Required for memory when using aux losses
+- x_0 formula: `x_0 = x_t - sigma * noise_pred`, clamped [-10, 10]
+- Defaults from StableAvatar: `aux_recon=1.0, sync=0.1, lpips=0.1, trepa=10.0`
+
+**External deps** (imported via sys.path from `/home/work/.local/Self-Forcing_LipSync_StableAvatar/`):
+StableSyncNet, melspectrogram (audio.py), TREPALoss, lpips pip package
+
 ## Gotchas
 
 - **Don't use `conda run` for multi-process accelerate** — it swallows output. Use
@@ -177,6 +198,12 @@ Detailed documentation for training code reconstruction:
   needed for multi-GPU DDP where each rank must init on its own device.
 - **System Python 3.12 packages can contaminate conda** — if imports fail with
   `av._core` errors, install `pyav` explicitly in the conda env.
+- **WanVideoVAE.decode() moves tensors to CPU** — breaks gradient flow for aux losses.
+  Use `pipe.vae.model.decode(latents, pipe.vae.scale)` directly + non-inplace `clamp(-1, 1)`.
+- **SyncNet expects exactly chunk_size (16) frames** — partial chunks cause channel mismatch.
+  Skip chunks with fewer than chunk_size frames.
+- **VAE `requires_grad_(False)` does NOT block gradient flow** — it only prevents gradient
+  accumulation on VAE params. Autograd still flows through for aux loss backprop to DiT.
 
 ## Model Configurations
 
