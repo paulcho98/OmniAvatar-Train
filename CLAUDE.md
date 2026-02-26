@@ -14,9 +14,11 @@ behavior to inference, with gradients flowing correctly through all components.
 - **Context management**: Compact when context reaches ~60%. Use subagents (Task tool
   with Explore type) for all code exploration to keep the main context clean.
 - **Environment**: `conda activate omniavatar`
-- **GPUs**: We have GPUs 2 and 3 available. Use `CUDA_VISIBLE_DEVICES=2,3`.
+- **GPUs**: We have GPUs 0 and 1 available. Use `CUDA_VISIBLE_DEVICES=0,1`.
 - **Write scope**: Full read/write access to everything within this repo
   (`/home/work/.local/OmniAvatar/`). Do NOT write to files outside this repo.
+- **Version control**: Commit and push after verified large changes so we can always
+  roll back. Don't let uncommitted work accumulate across major milestones.
 - After a productive session with significant code changes, run `/revise-claude-md` to
   capture new insights into this file.
 - Periodically ask "check if my CLAUDE.md is up to date" to trigger a full audit.

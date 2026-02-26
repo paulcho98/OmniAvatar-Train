@@ -1,0 +1,53 @@
+# OmniAvatar 14B Training Configuration
+
+# Model paths
+dit_paths: "pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00001-of-00006.safetensors,pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00002-of-00006.safetensors,pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00003-of-00006.safetensors,pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00004-of-00006.safetensors,pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00005-of-00006.safetensors,pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00006-of-00006.safetensors"
+text_encoder_path: "pretrained_models/Wan2.1-T2V-14B/models_t5_umt5-xxl-enc-bf16.pth"
+vae_path: "pretrained_models/Wan2.1-T2V-14B/Wan2.1_VAE.pth"
+wav2vec_path: "pretrained_models/wav2vec2-base-960h"
+omniavatar_ckpt: "pretrained_models/OmniAvatar-14B/pytorch_model.pt"
+
+# Dataset
+dataset_base_path: "/home/work/.local/combined_data/high_visual_quality"
+dataset_metadata_path: "metadata.csv"
+num_frames: 81
+height: 512
+width: 512
+dataset_repeat: 1
+num_workers: 4
+sample_rate: 16000
+fps: 25
+
+# LoRA (matches pretrained_models/OmniAvatar-14B/config.json)
+lora_rank: 128
+lora_alpha: 64.0
+lora_target_modules: "q,k,v,o,ffn.0,ffn.2"
+
+# Training
+learning_rate: 1e-4
+weight_decay: 0.01
+num_epochs: 1
+gradient_accumulation_steps: 4
+use_gradient_checkpointing: true
+use_gradient_checkpointing_offload: false
+
+# Checkpoint
+output_path: "./checkpoints/omniavatar-14b"
+save_steps: 500
+
+# Wandb
+use_wandb: true
+wandb_project: "OmniAvatar-Training"
+wandb_log_every: 10
+
+# Validation
+validation_steps: 500
+num_val_samples: 4
+val_num_inference_steps: 25
+val_cfg_scale: 4.5
+validate_at_start: true
+
+# SyncNet
+compute_sync_metrics: true
+syncnet_model_path: "/home/work/.local/LatentSync/checkpoints/auxiliary/syncnet_v2.model"
+s3fd_model_path: "/home/work/.local/LatentSync/checkpoints/auxiliary/sfd_face.pth"

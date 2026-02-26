@@ -25,7 +25,7 @@ def load_model_from_single_file(state_dict, model_names, model_classes, model_re
         if hasattr(model, "eval"):
             model = model.eval()
         if not infer: # 训练才初始化
-            model = model.to_empty(device=torch.device("cuda"))
+            model = model.to_empty(device=torch.device("cpu"))
             for name, param in model.named_parameters():
                 if param.dim() > 1:  # 通常只对权重矩阵而不是偏置做初始化
                     nn.init.xavier_uniform_(param, gain=0.05)
