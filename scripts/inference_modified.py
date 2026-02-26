@@ -1,3 +1,12 @@
+"""Modified OmniAvatar inference script aligned with training audio handling.
+
+Changes from inference.py:
+1. Removed 1-frame zero audio prefix for chunk 0 — audio frame 0 now has real audio
+   (matches training where all frames have corresponding audio)
+2. Updated audio padding logic to account for chunk 0 taking L frames (not L-1)
+3. Changed final video trim from ori_audio_len+1 to ori_audio_len (no silent reference frame)
+4. Audio prefix for chunk carry-forward initialized from real audio (not zeros)
+"""
 import subprocess
 import os, sys
 from glob import glob

@@ -53,9 +53,31 @@ OmniAvatar/                          # Root
 │       ├── trainers/unified_dataset.py # UnifiedDataset w/ LoadVideo, LoadAudio
 │       └── models/, schedulers/, etc.
 ├── scripts/inference.py             # Inference entry point (chunked generation loop)
+├── scripts/train.py                 # Training script (Accelerate + LoRA + wandb)
+├── scripts/inference_modified.py    # Modified inference (no zero audio prefix, matches training)
 ├── configs/                         # YAML configs (inference_1.3B.yaml, etc.)
 ├── examples/                        # Sample input files
 └── docs/                            # Reference documentation
+```
+
+## Running Training
+
+```bash
+# Single GPU (use env binaries directly, not conda run — it swallows multi-process output)
+CUDA_VISIBLE_DEVICES=0 /home/work/.local/miniconda3/envs/omniavatar/bin/accelerate launch \
+  --num_processes 1 scripts/train.py \
+  --dit_paths "pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-0000{1..6}-of-00006.safetensors" \
+  --text_encoder_path pretrained_models/Wan2.1-T2V-14B/models_t5_umt5-xxl-enc-bf16.pth \
+  --vae_path pretrained_models/Wan2.1-T2V-14B/Wan2.1_VAE.pth \
+  --wav2vec_path pretrained_models/wav2vec2-base-960h \
+  --omniavatar_ckpt pretrained_models/OmniAvatar-14B/pytorch_model.pt \
+  --dataset_base_path /path/to/videos --dataset_metadata_path metadata.csv \
+  --use_gradient_checkpointing --num_frames 81 --height 512 --width 512
+
+# 2 GPUs with gradient accumulation
+CUDA_VISIBLE_DEVICES=0,1 /home/work/.local/miniconda3/envs/omniavatar/bin/accelerate launch \
+  --config_file configs/accelerate_2gpus.yaml scripts/train.py [same args] \
+  --gradient_accumulation_steps 4
 ```
 
 ## Running Inference
@@ -139,6 +161,22 @@ Detailed documentation for training code reconstruction:
    stores the training config. When `reload_cfg: True` in YAML, this is loaded into the `args` singleton,
    providing `model_config: {in_dim: 33}`, `train_architecture: lora`, `lora_rank: 128`,
    `lora_alpha: 64`, `use_audio: true`, `i2v: true`, `random_prefix_frames: true`, etc.
+
+## Gotchas
+
+- **Don't use `conda run` for multi-process accelerate** — it swallows output. Use
+  `/home/work/.local/miniconda3/envs/omniavatar/bin/accelerate` directly.
+- **Wav2Vec2 must stay float32** — inference doesn't cast it to bf16, and the CNN
+  feature extractor fails on bf16 input.
+- **Audio must be trimmed to match video frame count** — if the source video is longer
+  than `num_frames`, `linear_interpolation` in Wav2Vec2 will compress all audio into
+  fewer frames, destroying sync.
+- **`pipe.device` is not updated by `model.to(device)`** — must set `pipe.device`
+  explicitly when using VAE encode/decode outside the Accelerate context.
+- **`model_manager.py` training init uses CPU** (we changed from hardcoded `cuda`) —
+  needed for multi-GPU DDP where each rank must init on its own device.
+- **System Python 3.12 packages can contaminate conda** — if imports fail with
+  `av._core` errors, install `pyav` explicitly in the conda env.
 
 ## Model Configurations
 

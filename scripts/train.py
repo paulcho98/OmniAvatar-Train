@@ -20,6 +20,7 @@ import os
 import sys
 import json
 import math
+import random
 import argparse
 import subprocess
 import tempfile
@@ -695,7 +696,7 @@ def launch_training(dataset, model, args):
     optimizer = torch.optim.AdamW(
         model.trainable_modules(), lr=args.learning_rate, weight_decay=args.weight_decay,
     )
-    lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
+    lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
 
     def collate_fn(batch):
         batch = [b for b in batch if b is not None]
@@ -774,6 +775,7 @@ def launch_training(dataset, model, args):
         )
 
     # --- Training loop ---
+    consecutive_nones = 0
     for epoch_id in range(args.num_epochs):
         epoch_pbar = tqdm(
             dataloader, desc=f"Epoch {epoch_id + 1}/{args.num_epochs}",
@@ -782,12 +784,20 @@ def launch_training(dataset, model, args):
 
         for data in epoch_pbar:
             if data is None:
+                consecutive_nones += 1
+                if consecutive_nones >= 50:
+                    raise RuntimeError(
+                        f"50 consecutive None samples — check dataset path and video files"
+                    )
                 continue
+            consecutive_nones = 0
 
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
                 loss = model(data)
                 accelerator.backward(loss)
+                if args.max_grad_norm > 0:
+                    accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 optimizer.step()
 
                 with torch.no_grad():
@@ -899,6 +909,9 @@ def train_parser():
     parser.add_argument("--use_gradient_checkpointing", action="store_true", default=False)
     parser.add_argument("--use_gradient_checkpointing_offload", action="store_true", default=False)
     parser.add_argument("--negative_prompt", type=str, default="")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0,
+                        help="Max gradient norm for clipping. 0 to disable.")
 
     # Checkpoint
     parser.add_argument("--output_path", type=str, default="./checkpoints/omniavatar-14b")
@@ -934,9 +947,38 @@ def train_parser():
 # Main
 # ============================================================================
 
+def set_seed(seed):
+    """Set random seed for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def load_config_yaml(args):
+    """Load YAML config and use values as defaults for unset args."""
+    if not args.config:
+        return args
+    import yaml
+    with open(args.config, "r") as f:
+        config = yaml.safe_load(f)
+    for key, value in config.items():
+        if not hasattr(args, key) or getattr(args, key) is None:
+            setattr(args, key, value)
+        elif isinstance(getattr(args, key), bool) and not getattr(args, key) and isinstance(value, bool):
+            setattr(args, key, value)
+    return args
+
+
 if __name__ == "__main__":
     parser = train_parser()
+    parser.add_argument("--config", type=str, default=None,
+                        help="Path to YAML config. CLI args override config values.")
     args = parser.parse_args()
+    args = load_config_yaml(args)
+
+    set_seed(args.seed)
 
     # Dataset
     dataset = OmniAvatarTrainingDataset(
