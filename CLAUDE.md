@@ -53,7 +53,10 @@ OmniAvatar/                          # Root
 │       ├── trainers/unified_dataset.py # UnifiedDataset w/ LoadVideo, LoadAudio
 │       └── models/, schedulers/, etc.
 ├── scripts/inference.py             # Inference entry point (chunked generation loop)
-├── scripts/train.py                 # Training script (Accelerate + LoRA + wandb)
+├── scripts/train.py                 # I2V training script (Accelerate + LoRA + wandb)
+├── scripts/train_v2v.py             # V2V lip sync training (49ch input, spatial mask)
+├── scripts/precompute_audio_omniavatar.py  # Audio precomputation (10752-dim embeddings)
+├── scripts/train_v2v_auxloss.sh     # Launch script for V2V training with aux losses
 ├── scripts/inference_modified.py    # Modified inference (no zero audio prefix, matches training)
 ├── configs/                         # YAML configs (inference_1.3B.yaml, etc.)
 ├── examples/                        # Sample input files
@@ -62,8 +65,14 @@ OmniAvatar/                          # Root
 
 ## Training Data
 
-- **Base path**: `/home/work/.local/combined_data/high_visual_quality` (NOT `/home/work/combined_data/`)
-- **Metadata**: `test_metadata.csv` (3 test samples for smoke tests)
+- **I2V base path**: `/home/work/.local/combined_data/high_visual_quality` (NOT `/home/work/combined_data/`)
+- **I2V metadata**: `test_metadata.csv` (in repo root, 3 test samples for smoke tests)
+- **V2V training**: `/home/work/stableavatar_data/v2v_training_data/` (29K videos)
+  - Path list: `video_square_path.txt` (one directory per line)
+  - Each dir has: `sub_clip.mp4`, `audio.wav`, `prompt.txt`, `vae_latents.pt`, `audio_emb_omniavatar.pt`
+- **V2V validation**: `/home/work/stableavatar_data/v2v_validation_data/{recon,mixed}/`
+  - Recon: 10 samples (same identity video + audio), Mixed: 12 samples (cross-identity)
+- **LatentSync mask**: `/home/work/.local/Self-Forcing_LipSync_StableAvatar/diffsynth/utils/mask.png`
 
 ## Running Training
 
@@ -83,6 +92,29 @@ CUDA_VISIBLE_DEVICES=0 /home/work/.local/miniconda3/envs/omniavatar/bin/accelera
 CUDA_VISIBLE_DEVICES=0,1 /home/work/.local/miniconda3/envs/omniavatar/bin/accelerate launch \
   --config_file configs/accelerate_2gpus.yaml scripts/train.py [same args] \
   --gradient_accumulation_steps 4
+```
+
+## Running V2V Training
+
+```bash
+# V2V with aux losses (single GPU, precomputed data)
+bash scripts/train_v2v_auxloss.sh
+
+# V2V without aux losses (no offloading needed, ~61 GB peak)
+CUDA_VISIBLE_DEVICES=0 /home/work/.local/miniconda3/envs/omniavatar/bin/accelerate launch \
+  --num_processes 1 --mixed_precision bf16 scripts/train_v2v.py \
+  [model paths] --data_list_path /path/to/video_square_path.txt \
+  --latentsync_mask_path /path/to/mask.png \
+  --use_precomputed_vae --use_precomputed_audio --use_gradient_checkpointing
+
+# Precompute OmniAvatar audio embeddings (2 GPUs parallel)
+CUDA_VISIBLE_DEVICES=0 python scripts/precompute_audio_omniavatar.py \
+  --wav2vec_path pretrained_models/wav2vec2-base-960h \
+  --data_list_path /path/to/video_square_path.txt --shard_id 0 --num_shards 2 &
+CUDA_VISIBLE_DEVICES=1 python scripts/precompute_audio_omniavatar.py \
+  --wav2vec_path pretrained_models/wav2vec2-base-960h \
+  --data_list_path /path/to/video_square_path.txt --shard_id 1 --num_shards 2 &
+wait
 ```
 
 ## Running Inference
@@ -183,8 +215,41 @@ text with empty encoding or audio with zeros during training for CFG support.
 **External deps** (imported via sys.path from `/home/work/.local/Self-Forcing_LipSync_StableAvatar/`):
 StableSyncNet, melspectrogram (audio.py), TREPALoss, lpips pip package
 
+## V2V Training (train_v2v.py)
+
+- **49-channel input**: 16ch noise + 16ch ref_repeated + 1ch spatial_mask + 16ch masked_video.
+  `in_dim=49` in args singleton (vs 33 for I2V train.py).
+- **Precomputed data**: `vae_latents.pt` from StableAvatar (compatible Wan VAE),
+  `audio_emb_omniavatar.pt` from our precompute script (10752-dim, NOT StableAvatar's 768-dim).
+- **Patch embedding expansion**: OmniAvatar ckpt has 33ch, model is 49ch. Constructor
+  handles expansion: copies 33ch weights, leaves channels 33-48 xavier-initialized.
+- **LatentSync mask**: 256x256 PNG (255=keep upper face, 0=mask mouth). Resized to latent
+  resolution (64x64) via bilinear interpolation + threshold. Inverted to OmniAvatar
+  convention (0=keep, 1=generate) before use.
+
+## VRAM Budget (14B model, 512x512x81, single H200 150GB)
+
+| Mode | DiT | T5 | VAE+W2V | Optimizer | Activations | Peak |
+|------|-----|----|---------|-----------|-------------|------|
+| No aux losses | 30 GB | 11 GB | 0.6 GB | 3.7 GB | ~17 GB | **~61 GB** |
+| With aux losses | 30 GB | 11 GB | 0.6 GB | 3.7 GB | ~100 GB | **~146 GB** |
+| Aux + offload_frozen | 30 GB | CPU | 0.6 GB | 3.7 GB | ~100 GB | **~134 GB** |
+
+- **`--offload_frozen` required with aux losses** — offloads T5 (11.36 GB) + Wav2Vec (0.38 GB)
+  to CPU. VAE stays on GPU (0.26 GB, needed for backward through aux losses).
+- **VAE decode is the VRAM spike**: decoding 21 latent frames → 81 RGB@512x512 costs ~50 GB.
+- **`--verbose_vram`**: prints VRAM at each stage of forward pass for debugging.
+
 ## Gotchas
 
+- **`dit.training=False` after accelerator.prepare()** — critical bug we fixed. The DiT's
+  gradient checkpointing checks `self.training` (wan_video_dit.py:405). Without explicit
+  `.train()`, it's silently False → 105+ GB activations instead of ~17 GB. Fixed via
+  `_set_training_modes()` (DiffSynth's `freeze_except` pattern): `.train()` on DiT,
+  `.eval()` on frozen components. Called in `__init__`, after `prepare()`, and defensively
+  in `forward()`.
+- **Don't offload VAE to CPU when using aux losses** — backward needs VAE weights on GPU
+  for gradient flow through the `with_grad=True` decode path.
 - **Don't use `conda run` for multi-process accelerate** — it swallows output. Use
   `/home/work/.local/miniconda3/envs/omniavatar/bin/accelerate` directly.
 - **Wav2Vec2 must stay float32** — inference doesn't cast it to bf16, and the CNN
