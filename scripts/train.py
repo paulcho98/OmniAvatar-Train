@@ -284,6 +284,17 @@ class OmniAvatarTrainingModule(nn.Module):
         self.scheduler = self.pipe.scheduler
         self.prompter = self.pipe.prompter
 
+        # Condition dropout (set from args in launch_training)
+        self.text_drop_prob = 0.0
+        self.audio_drop_prob = 0.0
+        self._empty_text_cache = None
+
+        # Auxiliary losses (initialized via setup_aux_losses if enabled)
+        self.syncnet = None
+        self.lpips_func = None
+        self.trepa_func = None
+        self._last_aux_losses = None
+
     def trainable_modules(self):
         """Return trainable parameters for optimizer."""
         return [p for p in self.parameters() if p.requires_grad]
@@ -360,11 +371,162 @@ class OmniAvatarTrainingModule(nn.Module):
         return torch.cat([image_cat, msk], dim=1)  # (1, 17, T, H, W)
 
     # ------------------------------------------------------------------
+    # Auxiliary losses setup and computation
+    # ------------------------------------------------------------------
+
+    def setup_aux_losses(self, args):
+        """Load frozen auxiliary models for training losses (SyncNet, LPIPS, TREPA)."""
+        self.aux_recon_weight = args.aux_recon_weight
+        self.aux_sync_weight = args.aux_sync_weight
+        self.aux_lpips_weight = args.aux_lpips_weight
+        self.aux_trepa_weight = args.aux_trepa_weight
+        self.aux_num_frames = args.aux_num_frames
+        self.sync_chunk_size = args.sync_chunk_size
+        self.sync_chunk_stride = args.sync_chunk_stride
+        self.sync_num_supervised_frames = args.sync_num_supervised_frames
+
+        # Enable VAE decoder gradient checkpointing
+        if args.use_vae_gradient_checkpointing:
+            self.pipe.vae.model.decoder.gradient_checkpointing = True
+            print("[AuxLoss] Enabled VAE decoder gradient checkpointing")
+
+        latentsync_path = "/home/work/.local/Self-Forcing_LipSync_StableAvatar"
+
+        # SyncNet
+        if args.use_sync_loss:
+            sys.path.insert(0, latentsync_path)
+            from latentsync_models.stable_syncnet import StableSyncNet
+            from omegaconf import OmegaConf
+            cfg = OmegaConf.load(args.syncnet_config_path)
+            self.syncnet = StableSyncNet(
+                OmegaConf.to_container(cfg.model), gradient_checkpointing=True
+            )
+            ckpt = torch.load(args.syncnet_checkpoint_path, map_location="cpu")
+            if "state_dict" in ckpt:
+                ckpt = ckpt["state_dict"]
+            self.syncnet.load_state_dict(ckpt, strict=True)
+            self.syncnet.requires_grad_(False)
+            self.syncnet.eval()
+            self.syncnet_config = cfg
+            # Import melspectrogram for sync loss
+            from latentsync_models.audio import melspectrogram as _mel_fn
+            self._melspectrogram = _mel_fn
+            print(f"[AuxLoss] Loaded SyncNet from {args.syncnet_checkpoint_path}")
+
+        # LPIPS
+        if args.use_lpips_loss:
+            import lpips as lpips_pkg
+            self.lpips_func = lpips_pkg.LPIPS(net="vgg")
+            self.lpips_func.requires_grad_(False)
+            self.lpips_func.eval()
+            print("[AuxLoss] Loaded LPIPS (VGG)")
+
+        # TREPA
+        if args.use_trepa_loss:
+            sys.path.insert(0, latentsync_path)
+            from latentsync_models.trepa.loss import TREPALoss
+            self.trepa_func = TREPALoss(
+                device="cpu", ckpt_path=args.trepa_checkpoint_path, with_cp=True
+            )
+            print(f"[AuxLoss] Loaded TREPA from {args.trepa_checkpoint_path}")
+
+    def _decode_for_aux_loss(self, latents, device, with_grad=True):
+        """Decode latents to RGB via VAE, bypassing CPU offload in WanVideoVAE.decode().
+
+        Uses self.pipe.vae.model.decode() directly with non-inplace clamp for autograd.
+        Gradient checkpointing (if enabled) is handled internally by Decoder3d.
+        """
+        self.pipe.vae.model.to(device)
+        latents = latents.to(device=device, dtype=self.pipe.vae.model.conv2.weight.dtype)
+        if with_grad:
+            rgb = self.pipe.vae.model.decode(latents, self.pipe.vae.scale)
+            return rgb.clamp(-1, 1)
+        else:
+            with torch.no_grad():
+                rgb = self.pipe.vae.model.decode(latents, self.pipe.vae.scale)
+                return rgb.clamp_(-1, 1)
+
+    def _compute_sync_loss(self, pred_rgb, audio_np, device):
+        """Chunked SyncNet loss. pred_rgb: [B,3,T,H,W] in [-1,1], audio_np: numpy 16kHz."""
+        from einops import rearrange
+
+        B, C, T, H, W = pred_rgb.shape
+        chunk_size = self.sync_chunk_size
+        stride = self.sync_chunk_stride
+        num_supervised = self.sync_num_supervised_frames
+        fps = 25
+        sr = 16000
+
+        # Flatten and resize to SyncNet resolution (256x256)
+        pred_flat = rearrange(pred_rgb, "b c t h w -> (b t) c h w")
+        pred_resized = F.interpolate(
+            pred_flat, size=(256, 256), mode="bicubic", align_corners=False
+        )
+        pred_lower = pred_resized[:, :, 128:, :]  # Lower half
+
+        chunk_losses = []
+        num_chunks = max(1, math.ceil((min(T, num_supervised) - chunk_size) / stride) + 1)
+
+        for i in range(num_chunks):
+            start = i * stride
+            end = min(start + chunk_size, T)
+            if end - start < chunk_size:
+                continue  # SyncNet expects exactly chunk_size frames
+
+            try:
+                # Visual: [B, chunk*3, 128, 256]
+                chunk_frames = pred_lower[start:end]
+                vis_input = rearrange(chunk_frames, "(b t) c h w -> b (t c) h w", b=B)
+
+                # Audio: extract mel for this chunk's time window
+                start_sample = int(start / fps * sr)
+                end_sample = int(end / fps * sr)
+                audio_seg = audio_np[start_sample:end_sample]
+                if len(audio_seg) < 100:
+                    audio_seg = np.zeros(int((end - start) / fps * sr), dtype=np.float32)
+                mel = self._melspectrogram(audio_seg)  # [80, time_steps]
+                mel_window = math.ceil((end - start) / 5.0 * 16)
+                mel_t = torch.from_numpy(mel).float()
+                mel_t = F.pad(mel_t, (0, max(0, mel_window - mel_t.shape[1])))[:, :mel_window]
+                mel_t = mel_t.unsqueeze(0).unsqueeze(0).to(device=device, dtype=torch.float16)
+
+                # SyncNet forward
+                v_emb, a_emb = self.syncnet(vis_input.half(), mel_t)
+                sims = F.cosine_similarity(v_emb, a_emb, dim=1).unsqueeze(1)
+                loss = F.binary_cross_entropy_with_logits(
+                    sims, torch.ones_like(sims)
+                ).mean()
+                chunk_losses.append(loss)
+            except Exception as e:
+                print(f"[SyncLoss] Warning: chunk {i} (frames {start}-{end}) failed: {e}")
+                continue
+
+        if not chunk_losses:
+            return torch.tensor(0.0, device=device, requires_grad=True)
+        return torch.stack(chunk_losses).mean()
+
+    def _compute_lpips_loss(self, pred_rgb, gt_rgb):
+        """LPIPS on lower half of face. pred/gt_rgb: [B,3,T,H,W] in [-1,1]."""
+        from einops import rearrange
+
+        pred_flat = rearrange(pred_rgb, "b c t h w -> (b t) c h w")
+        gt_flat = rearrange(gt_rgb, "b c t h w -> (b t) c h w")
+        H = pred_flat.shape[2]
+        return self.lpips_func(
+            pred_flat[:, :, H // 2 :, :].float(),
+            gt_flat[:, :, H // 2 :, :].float(),
+        ).mean()
+
+    def _compute_trepa_loss(self, pred_rgb, gt_rgb):
+        """TREPA temporal consistency loss. pred/gt_rgb: [B,3,T,H,W] in [-1,1]."""
+        return self.trepa_func(pred_rgb, gt_rgb)
+
+    # ------------------------------------------------------------------
     # Forward pass — flow matching training loss
     # ------------------------------------------------------------------
 
     def forward(self, data):
-        """Training forward pass. Must match inference DiT forward exactly."""
+        """Training forward pass with condition dropout and optional auxiliary losses."""
         device = next(self.dit.parameters()).device
 
         # 1. Encode text
@@ -375,15 +537,24 @@ class OmniAvatarTrainingModule(nn.Module):
         audio_emb = self.encode_audio(data["audio"], num_video_frames, device)
         audio_emb = audio_emb.to(dtype=self.dtype, device=device)
 
-        # 3. Encode GT video
+        # 3. Condition dropout for CFG training
+        if self.training:
+            if self.text_drop_prob > 0 and random.random() < self.text_drop_prob:
+                if self._empty_text_cache is None:
+                    self._empty_text_cache = self.encode_text("", device)
+                context = self._empty_text_cache.clone()
+            if self.audio_drop_prob > 0 and random.random() < self.audio_drop_prob:
+                audio_emb = torch.zeros_like(audio_emb)
+
+        # 4. Encode GT video
         input_latents = self.encode_video(data["video"], device)
 
-        # 4. Prepare reference frame
+        # 5. Prepare reference frame
         ref_latent = input_latents[:, :, :1]
         T_lat = input_latents.shape[2]
         y = self.prepare_reference_input(ref_latent, T_lat)
 
-        # 5. Sample noise + timestep
+        # 6. Sample noise + timestep
         noise = torch.randn_like(input_latents)
         num_timesteps = len(self.scheduler.timesteps)
         timestep_id = torch.randint(0, num_timesteps, (1,))
@@ -392,7 +563,7 @@ class OmniAvatarTrainingModule(nn.Module):
         noisy_latents = self.scheduler.add_noise(input_latents, noise, timestep)
         training_target = self.scheduler.training_target(input_latents, noise, timestep)
 
-        # 6. DiT forward (THE critical call)
+        # 7. DiT forward (THE critical call)
         noise_pred = self.dit(
             x=noisy_latents, timestep=timestep, context=context, y=y,
             audio_emb=audio_emb,
@@ -400,8 +571,59 @@ class OmniAvatarTrainingModule(nn.Module):
             use_gradient_checkpointing_offload=self.use_gradient_checkpointing_offload,
         )
 
-        # 7. Flow matching loss
+        # 8. Flow matching MSE loss
         loss = F.mse_loss(noise_pred.float(), training_target.float())
+
+        # 9. Auxiliary losses on decoded x_0 (SyncNet, LPIPS, TREPA)
+        use_any_aux = (self.syncnet is not None or self.lpips_func is not None
+                       or self.trepa_func is not None)
+        if use_any_aux:
+            sigma = self.scheduler.sigmas[timestep_id].to(
+                device=device, dtype=noise_pred.dtype
+            )
+            sync_len = self.aux_num_frames if self.aux_num_frames > 0 else T_lat
+
+            # x_0 prediction: x_0 = x_t - sigma * noise_pred (flow matching)
+            x_0_pred = noisy_latents[:, :, :sync_len] - sigma * noise_pred[:, :, :sync_len]
+            x_0_pred = torch.clamp(x_0_pred, -10, 10)
+
+            # Decode predicted x_0 to RGB (WITH gradients through VAE)
+            pred_rgb = self._decode_for_aux_loss(x_0_pred, device, with_grad=True)
+
+            # Decode GT to RGB (NO gradients)
+            gt_rgb = self._decode_for_aux_loss(
+                input_latents[:, :, :sync_len].detach(), device, with_grad=False
+            )
+
+            # Compute enabled losses
+            sync_loss = torch.tensor(0.0, device=device)
+            lpips_loss = torch.tensor(0.0, device=device)
+            trepa_loss = torch.tensor(0.0, device=device)
+
+            if self.syncnet is not None:
+                sync_loss = self._compute_sync_loss(pred_rgb, data["audio"], device)
+            if self.lpips_func is not None:
+                lpips_loss = self._compute_lpips_loss(pred_rgb, gt_rgb)
+            if self.trepa_func is not None and pred_rgb.shape[2] >= 16:
+                trepa_loss = self._compute_trepa_loss(pred_rgb, gt_rgb)
+
+            # Combine: weighted sum replaces raw MSE
+            loss = (
+                loss * self.aux_recon_weight
+                + sync_loss * self.aux_sync_weight
+                + lpips_loss * self.aux_lpips_weight
+                + trepa_loss * self.aux_trepa_weight
+            )
+
+            # Store for wandb logging
+            self._last_aux_losses = {
+                "mse": F.mse_loss(noise_pred.float(), training_target.float()).detach().item(),
+                "sync": sync_loss.detach().item(),
+                "lpips": lpips_loss.detach().item(),
+                "trepa": trepa_loss.detach().item(),
+            }
+
+        # 10. Apply timestep weighting
         loss = loss * self.scheduler.training_weight(timestep)
         return loss
 
@@ -711,6 +933,27 @@ def launch_training(dataset, model, args):
         model, optimizer, dataloader, lr_scheduler,
     )
 
+    # --- Wire up condition dropout and aux losses ---
+    unwrapped_init = accelerator.unwrap_model(model)
+    unwrapped_init.text_drop_prob = args.text_drop_prob
+    unwrapped_init.audio_drop_prob = args.audio_drop_prob
+    if args.text_drop_prob > 0 or args.audio_drop_prob > 0:
+        accelerator.print(
+            f"[Train] Condition dropout: text={args.text_drop_prob}, audio={args.audio_drop_prob}"
+        )
+
+    # Move auxiliary loss models to device (if setup_aux_losses was called before prepare)
+    if unwrapped_init.syncnet is not None:
+        unwrapped_init.syncnet = unwrapped_init.syncnet.to(
+            device=accelerator.device, dtype=torch.float16
+        )
+    if unwrapped_init.lpips_func is not None:
+        unwrapped_init.lpips_func = unwrapped_init.lpips_func.to(device=accelerator.device)
+    if unwrapped_init.trepa_func is not None:
+        unwrapped_init.trepa_func.model = unwrapped_init.trepa_func.model.to(
+            device=accelerator.device
+        )
+
     # --- Preload validation samples ---
     val_samples = []
     if args.validation_steps > 0 and accelerator.is_main_process:
@@ -825,13 +1068,19 @@ def launch_training(dataset, model, args):
                     if use_wandb and global_step % args.wandb_log_every == 0:
                         try:
                             import wandb
-                            wandb.log({
+                            log_dict = {
                                 "loss/step": step_loss, "loss/ema": ema_loss,
                                 "loss/window_mean": window_loss_sum / max(1, window_loss_count),
                                 "loss/cum_mean": cum_loss_sum / max(1, cum_loss_count),
                                 "train/epoch": epoch_id,
                                 "train/lr": lr_scheduler.get_last_lr()[0],
-                            }, step=global_step)
+                            }
+                            # Auxiliary loss components
+                            uw = accelerator.unwrap_model(model)
+                            if uw._last_aux_losses:
+                                for k, v in uw._last_aux_losses.items():
+                                    log_dict[f"aux/{k}"] = v
+                            wandb.log(log_dict, step=global_step)
                         except Exception as e:
                             print(f"[W&B] log error: {e}")
                         window_loss_sum = window_loss_count = 0.0
@@ -913,6 +1162,12 @@ def train_parser():
     parser.add_argument("--max_grad_norm", type=float, default=1.0,
                         help="Max gradient norm for clipping. 0 to disable.")
 
+    # Condition dropout for CFG training
+    parser.add_argument("--text_drop_prob", type=float, default=0.1,
+                        help="Probability of dropping text condition (replacing with empty encoding)")
+    parser.add_argument("--audio_drop_prob", type=float, default=0.1,
+                        help="Probability of dropping audio condition (replacing with zeros)")
+
     # Checkpoint
     parser.add_argument("--output_path", type=str, default="./checkpoints/omniavatar-14b")
     parser.add_argument("--save_steps", type=int, default=None)
@@ -933,12 +1188,37 @@ def train_parser():
     parser.add_argument("--val_cfg_scale", type=float, default=4.5)
     parser.add_argument("--validate_at_start", action="store_true", default=False)
 
-    # SyncNet
+    # SyncNet (validation metrics)
     parser.add_argument("--compute_sync_metrics", action="store_true", default=False)
     parser.add_argument("--syncnet_model_path", type=str,
                         default="/home/work/.local/LatentSync/checkpoints/auxiliary/syncnet_v2.model")
     parser.add_argument("--s3fd_model_path", type=str,
                         default="/home/work/.local/LatentSync/checkpoints/auxiliary/sfd_face.pth")
+
+    # Auxiliary losses (SyncNet, LPIPS, TREPA on VAE-decoded x_0)
+    parser.add_argument("--use_sync_loss", action="store_true", default=False,
+                        help="Enable SyncNet audio-visual sync training loss")
+    parser.add_argument("--use_lpips_loss", action="store_true", default=False,
+                        help="Enable LPIPS perceptual training loss (lower half)")
+    parser.add_argument("--use_trepa_loss", action="store_true", default=False,
+                        help="Enable TREPA temporal consistency training loss")
+    parser.add_argument("--aux_recon_weight", type=float, default=1.0)
+    parser.add_argument("--aux_sync_weight", type=float, default=0.1)
+    parser.add_argument("--aux_lpips_weight", type=float, default=0.1)
+    parser.add_argument("--aux_trepa_weight", type=float, default=10.0)
+    parser.add_argument("--aux_num_frames", type=int, default=21,
+                        help="Latent frames to decode for aux losses. 21 → 81 RGB frames. 0 = all.")
+    parser.add_argument("--sync_chunk_size", type=int, default=16)
+    parser.add_argument("--sync_chunk_stride", type=int, default=8)
+    parser.add_argument("--sync_num_supervised_frames", type=int, default=80)
+    parser.add_argument("--use_vae_gradient_checkpointing", action="store_true", default=False,
+                        help="Enable gradient checkpointing in VAE decoder (for aux losses)")
+    parser.add_argument("--syncnet_config_path", type=str,
+                        default="/home/work/.local/Self-Forcing_LipSync_StableAvatar/latentsync_models/configs/syncnet/syncnet_16_pixel_attn.yaml")
+    parser.add_argument("--syncnet_checkpoint_path", type=str,
+                        default="/home/work/.local/Self-Forcing_LipSync_StableAvatar/examples/wanvideo/model_training/checkpoints/stable_syncnet.pt")
+    parser.add_argument("--trepa_checkpoint_path", type=str,
+                        default="/home/work/.local/Self-Forcing_LipSync_StableAvatar/examples/wanvideo/model_training/checkpoints/auxiliary/vit_g_hybrid_pt_1200e_ssv2_ft.pth")
 
     return parser
 
@@ -1008,6 +1288,10 @@ if __name__ == "__main__":
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[Model] Total: {total:,} | Trainable: {trainable:,} ({trainable/total*100:.2f}%)")
+
+    # Setup auxiliary losses (before accelerator.prepare)
+    if args.use_sync_loss or args.use_lpips_loss or args.use_trepa_loss:
+        model.setup_aux_losses(args)
 
     # Train
     launch_training(dataset, model, args)

@@ -429,7 +429,27 @@ class Decoder3d(nn.Module):
         self.head = nn.Sequential(RMS_norm(out_dim, images=False), nn.SiLU(),
                                   CausalConv3d(out_dim, 3, 3, padding=1))
 
+        # Gradient checkpointing support (default off, enable for aux loss training)
+        self.gradient_checkpointing = False
+
     def forward(self, x, feat_cache=None, feat_idx=[0]):
+        if torch.is_grad_enabled() and self.gradient_checkpointing:
+            def create_custom_forward(module):
+                def custom_forward(*inputs):
+                    return module._decode(*inputs)
+                return custom_forward
+            return torch.utils.checkpoint.checkpoint(
+                create_custom_forward(self),
+                x, feat_cache, feat_idx,
+                use_reentrant=False
+            )
+        else:
+            return self._decode(x, feat_cache, feat_idx)
+
+    def _decode(self, x, in_cache=None, feat_idx=[0]):
+        # Copy input cache to prevent mutations during gradient checkpoint recomputation
+        feat_cache = in_cache.copy() if in_cache is not None else None
+
         ## conv1
         if feat_cache is not None:
             idx = feat_idx[0]
@@ -478,7 +498,10 @@ class Decoder3d(nn.Module):
                 feat_idx[0] += 1
             else:
                 x = layer(x)
-        return x
+
+        # Reset index counter for consistent state across checkpoint recomputations
+        feat_idx[0] = 0
+        return x, feat_cache
 
 
 def count_conv3d(model):
@@ -564,14 +587,16 @@ class VideoVAE_(nn.Module):
         for i in range(iter_):
             self._conv_idx = [0]
             if i == 0:
-                out = self.decoder(x[:, :, i:i + 1, :, :],
-                                   feat_cache=self._feat_map,
-                                   feat_idx=self._conv_idx)
+                out, self._feat_map = self.decoder(
+                    x[:, :, i:i + 1, :, :],
+                    feat_cache=self._feat_map,
+                    feat_idx=self._conv_idx)
             else:
-                out_ = self.decoder(x[:, :, i:i + 1, :, :],
-                                    feat_cache=self._feat_map,
-                                    feat_idx=self._conv_idx)
-                out = torch.cat([out, out_], 2) # may add tensor offload
+                out_, self._feat_map = self.decoder(
+                    x[:, :, i:i + 1, :, :],
+                    feat_cache=self._feat_map,
+                    feat_idx=self._conv_idx)
+                out = torch.cat([out, out_], 2)
         return out
 
     def reparameterize(self, mu, log_var):
