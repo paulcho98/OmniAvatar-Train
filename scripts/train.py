@@ -295,6 +295,40 @@ class OmniAvatarTrainingModule(nn.Module):
         self.trepa_func = None
         self._last_aux_losses = None
 
+        # VRAM management
+        self.offload_frozen = False
+        self.verbose_vram = False
+
+        # Explicit train/eval modes (DiffSynth freeze_except pattern)
+        self._set_training_modes()
+
+    def _set_training_modes(self):
+        """Set train/eval modes explicitly following DiffSynth's freeze_except pattern.
+
+        Critical: wan_video_dit.py:405 checks `self.training` to enable gradient
+        checkpointing. Without explicit .train(), this can silently be False after
+        accelerator.prepare(), causing 105+ GB activation memory instead of ~17 GB.
+        """
+        self.pipe.dit.train()
+        self.pipe.text_encoder.eval()
+        self.pipe.vae.eval()
+        self.wav2vec.eval()
+        if self.syncnet is not None:
+            self.syncnet.eval()
+        if self.lpips_func is not None:
+            self.lpips_func.eval()
+        if self.trepa_func is not None:
+            self.trepa_func.eval()
+
+    def _log_vram(self, label):
+        """Log VRAM usage if verbose_vram is enabled."""
+        if not self.verbose_vram:
+            return
+        if torch.cuda.is_available():
+            alloc = torch.cuda.memory_allocated() / 1e9
+            peak = torch.cuda.max_memory_allocated() / 1e9
+            print(f"  [VRAM {label}] alloc={alloc:.2f}GB peak={peak:.2f}GB")
+
     def trainable_modules(self):
         """Return trainable parameters for optimizer."""
         return [p for p in self.parameters() if p.requires_grad]
@@ -529,25 +563,48 @@ class OmniAvatarTrainingModule(nn.Module):
         """Training forward pass with condition dropout and optional auxiliary losses."""
         device = next(self.dit.parameters()).device
 
+        # Defensive: ensure DiT is in training mode for gradient checkpointing
+        if not self.dit.training:
+            self.dit.train()
+        self._log_vram("forward-start")
+
         # 1. Encode text
+        if self.offload_frozen:
+            self.text_encoder.to(device)
         context = self.encode_text(data["prompt"], device)
+        if self.offload_frozen:
+            self.text_encoder.to("cpu")
+            torch.cuda.empty_cache()
+        self._log_vram("after-text-encode")
 
         # 2. Encode audio
+        if self.offload_frozen:
+            self.wav2vec.to(device)
         num_video_frames = len(data["video"])
         audio_emb = self.encode_audio(data["audio"], num_video_frames, device)
         audio_emb = audio_emb.to(dtype=self.dtype, device=device)
+        if self.offload_frozen:
+            self.wav2vec.to("cpu")
+            torch.cuda.empty_cache()
+        self._log_vram("after-audio-encode")
 
         # 3. Condition dropout for CFG training
         if self.training:
             if self.text_drop_prob > 0 and random.random() < self.text_drop_prob:
                 if self._empty_text_cache is None:
+                    if self.offload_frozen:
+                        self.text_encoder.to(device)
                     self._empty_text_cache = self.encode_text("", device)
+                    if self.offload_frozen:
+                        self.text_encoder.to("cpu")
+                        torch.cuda.empty_cache()
                 context = self._empty_text_cache.clone()
             if self.audio_drop_prob > 0 and random.random() < self.audio_drop_prob:
                 audio_emb = torch.zeros_like(audio_emb)
 
-        # 4. Encode GT video
+        # 4. Encode GT video (VAE always on GPU — only 0.26 GB)
         input_latents = self.encode_video(data["video"], device)
+        self._log_vram("after-vae-encode")
 
         # 5. Prepare reference frame
         ref_latent = input_latents[:, :, :1]
@@ -562,6 +619,7 @@ class OmniAvatarTrainingModule(nn.Module):
 
         noisy_latents = self.scheduler.add_noise(input_latents, noise, timestep)
         training_target = self.scheduler.training_target(input_latents, noise, timestep)
+        self._log_vram("before-dit-forward")
 
         # 7. DiT forward (THE critical call)
         noise_pred = self.dit(
@@ -570,6 +628,7 @@ class OmniAvatarTrainingModule(nn.Module):
             use_gradient_checkpointing=self.use_gradient_checkpointing,
             use_gradient_checkpointing_offload=self.use_gradient_checkpointing_offload,
         )
+        self._log_vram("after-dit-forward")
 
         # 8. Flow matching MSE loss
         loss = F.mse_loss(noise_pred.float(), training_target.float())
@@ -578,6 +637,7 @@ class OmniAvatarTrainingModule(nn.Module):
         use_any_aux = (self.syncnet is not None or self.lpips_func is not None
                        or self.trepa_func is not None)
         if use_any_aux:
+            self._log_vram("before-aux-losses")
             sigma = self.scheduler.sigmas[timestep_id].to(
                 device=device, dtype=noise_pred.dtype
             )
@@ -587,13 +647,14 @@ class OmniAvatarTrainingModule(nn.Module):
             x_0_pred = noisy_latents[:, :, :sync_len] - sigma * noise_pred[:, :, :sync_len]
             x_0_pred = torch.clamp(x_0_pred, -10, 10)
 
-            # Decode predicted x_0 to RGB (WITH gradients through VAE)
+            # VAE always on GPU (0.26 GB) — backward needs it for gradient flow
             pred_rgb = self._decode_for_aux_loss(x_0_pred, device, with_grad=True)
+            self._log_vram("after-vae-decode-pred")
 
-            # Decode GT to RGB (NO gradients)
             gt_rgb = self._decode_for_aux_loss(
                 input_latents[:, :, :sync_len].detach(), device, with_grad=False
             )
+            self._log_vram("after-vae-decode-gt")
 
             # Compute enabled losses
             sync_loss = torch.tensor(0.0, device=device)
@@ -647,19 +708,32 @@ def run_validation(model, val_sample, device, num_inference_steps=25,
 
     num_video_frames = len(val_sample["video"])
 
-    # 1. Encode text
+    # 1. Encode text (transient GPU load if offloading)
+    if model.offload_frozen:
+        model.text_encoder.to(device)
     context = model.encode_text(val_sample["prompt"], device)
 
     # 2. Encode audio
+    if model.offload_frozen:
+        model.wav2vec.to(device)
     audio_emb = model.encode_audio(val_sample["audio"], num_video_frames, device)
     audio_emb = audio_emb.to(dtype=model.dtype, device=device)
+    if model.offload_frozen:
+        model.wav2vec.to("cpu")
+        torch.cuda.empty_cache()
+
+    # Negative text for CFG
+    neg_context = model.encode_text(negative_prompt, device) if guidance_scale != 1.0 else None
+    if model.offload_frozen:
+        model.text_encoder.to("cpu")
+        torch.cuda.empty_cache()
 
     # 3. Encode reference image as SINGLE frame (matching inference.py:270)
     ref_image = val_sample["ref_image"]
     ref_np = np.array(ref_image, dtype=np.float32) * (2.0 / 255.0) - 1.0
     ref_t = torch.from_numpy(ref_np).permute(2, 0, 1)  # (C, H, W)
     ref_video = ref_t.unsqueeze(1).unsqueeze(0)  # (1, C, 1, H, W)
-    model.vae.to(device)
+    # VAE stays on GPU (only 0.26 GB)
     old_device = pipe.device
     pipe.device = device
     ref_latent = model.vae.encode(
@@ -674,7 +748,6 @@ def run_validation(model, val_sample, device, num_inference_steps=25,
     y = model.prepare_reference_input(ref_latent, T_lat)
 
     # 6. Build the "clean" latent for fixed-frame overwriting (matching inference.py:306)
-    # lat = [ref_latent, zeros for remaining frames]
     lat = torch.cat([
         ref_latent,
         torch.zeros(1, 16, T_lat - 1, ref_latent.shape[3], ref_latent.shape[4],
@@ -683,15 +756,11 @@ def run_validation(model, val_sample, device, num_inference_steps=25,
 
     # 7. Start from pure noise
     latents = torch.randn_like(lat)
-    fixed_frame = 1  # first_fixed_frame = 1 in inference (first chunk)
-
-    # Negative text for CFG
-    neg_context = model.encode_text(negative_prompt, device) if guidance_scale != 1.0 else None
+    fixed_frame = 1
 
     pipe.scheduler.set_timesteps(num_inference_steps, shift=5.0)
 
     for progress_id, ts in enumerate(pipe.scheduler.timesteps):
-        # Fixed-frame overwriting (matching inference wan_video.py:256-257)
         if fixed_frame > 0:
             latents[:, :, :fixed_frame] = lat[:, :, :fixed_frame]
 
@@ -712,20 +781,19 @@ def run_validation(model, val_sample, device, num_inference_steps=25,
 
         latents = pipe.scheduler.step(noise_pred, ts, latents)
 
-    # Final fixed-frame overwrite
     if fixed_frame > 0:
         latents[:, :, :fixed_frame] = lat[:, :, :fixed_frame]
 
-    # Decode
+    # Decode (VAE stays on GPU)
     frames = pipe.decode_video(latents, tiled=True, tile_size=(34, 34), tile_stride=(18, 16))
     pipe.device = old_device
     if frames.dim() == 5:
         frames = frames[0]
     video_frames = pipe.tensor2video(frames)
 
-    # Restore scheduler
+    # Restore scheduler and training modes
     pipe.scheduler.set_timesteps(1000, training=True)
-    model.train()
+    model._set_training_modes()
     return video_frames
 
 
@@ -933,8 +1001,28 @@ def launch_training(dataset, model, args):
         model, optimizer, dataloader, lr_scheduler,
     )
 
-    # --- Wire up condition dropout and aux losses ---
+    # --- Post-prepare setup ---
     unwrapped_init = accelerator.unwrap_model(model)
+
+    # Re-apply training modes (accelerator.prepare may alter training state)
+    unwrapped_init._set_training_modes()
+    unwrapped_init.verbose_vram = getattr(args, "verbose_vram", False)
+
+    # Optional: offload frozen encoders to CPU (T5 + Wav2Vec only).
+    # VAE stays on GPU — it's only 0.26 GB and backward needs it for aux loss gradients.
+    if getattr(args, "offload_frozen", False):
+        unwrapped_init.offload_frozen = True
+        unwrapped_init.text_encoder.to("cpu")
+        unwrapped_init.wav2vec.to("cpu")
+        torch.cuda.empty_cache()
+
+    if accelerator.is_main_process:
+        alloc = torch.cuda.memory_allocated() / 1e9
+        accelerator.print(f"[VRAM] After prepare: {alloc:.2f} GB on GPU, "
+                          f"dit.training={unwrapped_init.dit.training}, "
+                          f"offload_frozen={unwrapped_init.offload_frozen}")
+
+    # Condition dropout
     unwrapped_init.text_drop_prob = args.text_drop_prob
     unwrapped_init.audio_drop_prob = args.audio_drop_prob
     if args.text_drop_prob > 0 or args.audio_drop_prob > 0:
@@ -942,7 +1030,7 @@ def launch_training(dataset, model, args):
             f"[Train] Condition dropout: text={args.text_drop_prob}, audio={args.audio_drop_prob}"
         )
 
-    # Move auxiliary loss models to device (if setup_aux_losses was called before prepare)
+    # Move auxiliary loss models to device
     if unwrapped_init.syncnet is not None:
         unwrapped_init.syncnet = unwrapped_init.syncnet.to(
             device=accelerator.device, dtype=torch.float16
@@ -1167,6 +1255,13 @@ def train_parser():
                         help="Probability of dropping text condition (replacing with empty encoding)")
     parser.add_argument("--audio_drop_prob", type=float, default=0.1,
                         help="Probability of dropping audio condition (replacing with zeros)")
+
+    # VRAM management
+    parser.add_argument("--offload_frozen", action="store_true", default=False,
+                        help="Offload frozen encoders (T5, VAE, Wav2Vec) to CPU between uses. "
+                             "Saves ~12 GB VRAM but adds latency per step.")
+    parser.add_argument("--verbose_vram", action="store_true", default=False,
+                        help="Print VRAM usage at each stage of the forward pass.")
 
     # Checkpoint
     parser.add_argument("--output_path", type=str, default="./checkpoints/omniavatar-14b")
