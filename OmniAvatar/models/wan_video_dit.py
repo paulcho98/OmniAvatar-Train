@@ -7,13 +7,14 @@ from einops import rearrange
 from ..utils.io_utils import hash_state_dict_keys
 from .audio_pack import AudioPack
 from ..utils.args_config import args
-from xfuser.core.distributed import (get_sequence_parallel_rank,
-                                     get_sequence_parallel_world_size,
-                                     get_sp_group)
+
+# IMPORTANT: Import flash_attn_interface BEFORE xfuser to avoid operator conflicts
+# xfuser registers simplified flash_attn_3 operators that would override the real ones
 try:
     import flash_attn_interface
     FLASH_ATTN_3_AVAILABLE = True
 except ModuleNotFoundError:
+    flash_attn_interface = None
     FLASH_ATTN_3_AVAILABLE = False
 
 try:
@@ -27,16 +28,53 @@ try:
     SAGE_ATTN_AVAILABLE = True
 except ModuleNotFoundError:
     SAGE_ATTN_AVAILABLE = False
-    
-    
+
+# Lazy import for xfuser - import AFTER flash_attn to avoid operator conflicts
+_xfuser_imported = False
+_xfuser_get_sequence_parallel_rank = None
+_xfuser_get_sequence_parallel_world_size = None
+_xfuser_get_sp_group = None
+
+def _lazy_import_xfuser():
+    """Lazily import xfuser only when context parallel is actually used."""
+    global _xfuser_imported, _xfuser_get_sequence_parallel_rank
+    global _xfuser_get_sequence_parallel_world_size, _xfuser_get_sp_group
+    if not _xfuser_imported:
+        from xfuser.core.distributed import (
+            get_sequence_parallel_rank,
+            get_sequence_parallel_world_size,
+            get_sp_group
+        )
+        _xfuser_get_sequence_parallel_rank = get_sequence_parallel_rank
+        _xfuser_get_sequence_parallel_world_size = get_sequence_parallel_world_size
+        _xfuser_get_sp_group = get_sp_group
+        _xfuser_imported = True
+
+def get_sequence_parallel_rank():
+    _lazy_import_xfuser()
+    return _xfuser_get_sequence_parallel_rank()
+
+def get_sequence_parallel_world_size():
+    _lazy_import_xfuser()
+    return _xfuser_get_sequence_parallel_world_size()
+
+def get_sp_group():
+    _lazy_import_xfuser()
+    return _xfuser_get_sp_group()
+
+
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False):
+    # When context parallel is enabled (sp_size > 1), xfuser conflicts with flash_attn_3
+    # so we must fall back to flash_attn_2 or SDPA
+    use_flash_attn_3 = FLASH_ATTN_3_AVAILABLE and (args is None or getattr(args, 'sp_size', 1) <= 1)
+    
     if compatibility_mode:
         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
         v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
         x = F.scaled_dot_product_attention(q, k, v)
         x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
-    elif FLASH_ATTN_3_AVAILABLE:
+    elif use_flash_attn_3:
         q = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b s n d", n=num_heads)
         v = rearrange(v, "b s (n d) -> b s n d", n=num_heads)

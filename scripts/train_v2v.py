@@ -45,7 +45,8 @@ from tqdm import tqdm
 from PIL import Image
 from peft import LoraConfig, inject_adapter_in_model
 from accelerate import Accelerator
-from accelerate.utils import DistributedDataParallelKwargs
+from accelerate.utils import InitProcessGroupKwargs
+from datetime import timedelta
 import torchvision.transforms as transforms
 from transformers import Wav2Vec2FeatureExtractor
 
@@ -102,7 +103,8 @@ class OmniAvatarV2VDataset(torch.utils.data.Dataset):
     def __init__(self, data_list_path, num_frames=81, height=512, width=512,
                  sample_rate=16000, fps=25, repeat=1,
                  latentsync_mask_path=None,
-                 use_precomputed_vae=False, use_precomputed_audio=False):
+                 use_precomputed_vae=False, use_precomputed_audio=False,
+                 use_precomputed_text_emb=False):
         self.num_frames = num_frames
         self.height = height
         self.width = width
@@ -111,6 +113,7 @@ class OmniAvatarV2VDataset(torch.utils.data.Dataset):
         self.repeat = repeat
         self.use_precomputed_vae = use_precomputed_vae
         self.use_precomputed_audio = use_precomputed_audio
+        self.use_precomputed_text_emb = use_precomputed_text_emb
 
         # Read video directories
         with open(data_list_path) as f:
@@ -143,7 +146,17 @@ class OmniAvatarV2VDataset(torch.utils.data.Dataset):
             audio_data = torch.load(audio_path, map_location="cpu")
             result["precomputed_audio_emb"] = audio_data["audio_emb"]  # [total_frames, 10752]
 
-        # Prompt
+        # Precomputed text embeddings
+        if self.use_precomputed_text_emb:
+            text_emb_path = os.path.join(video_dir, "text_emb.pt")
+            if os.path.exists(text_emb_path):
+                result["precomputed_text_emb"] = torch.load(
+                    text_emb_path, map_location="cpu", weights_only=False
+                )
+            else:
+                print(f"[Dataset] WARNING: text_emb.pt missing in {video_dir}, falling back to live T5 encoding")
+
+        # Prompt (still needed as fallback or for text dropout empty encoding init)
         prompt_path = os.path.join(video_dir, "prompt.txt")
         if os.path.exists(prompt_path):
             with open(prompt_path) as f:
@@ -248,8 +261,8 @@ class OmniAvatarV2VDataset(torch.utils.data.Dataset):
     def __getitem__(self, data_id):
         video_dir = self.video_dirs[data_id % len(self.video_dirs)]
         try:
-            if self.use_precomputed_vae or self.use_precomputed_audio:
-                # Use precomputed path — can mix precomputed VAE with live audio or vice versa
+            if self.use_precomputed_vae or self.use_precomputed_audio or self.use_precomputed_text_emb:
+                # Use precomputed path — can mix precomputed VAE/audio/text
                 result = self._getitem_precomputed(video_dir)
                 # If VAE not precomputed, load video live for forward() to encode
                 if not self.use_precomputed_vae:
@@ -429,7 +442,11 @@ class OmniAvatarV2VTrainingModule(nn.Module):
         if self.lpips_func is not None:
             self.lpips_func.eval()
         if self.trepa_func is not None:
-            self.trepa_func.eval()
+            # TREPALoss is not an nn.Module, but its internal model is
+            if hasattr(self.trepa_func, 'model'):
+                self.trepa_func.model.eval()
+            elif hasattr(self.trepa_func, 'eval'):
+                self.trepa_func.eval()
 
     def _log_vram(self, label):
         """Log VRAM usage if verbose_vram is enabled."""
@@ -708,13 +725,19 @@ class OmniAvatarV2VTrainingModule(nn.Module):
             self.dit.train()
         self._log_vram("forward-start")
 
-        # 1. Encode text
-        if self.offload_frozen:
-            self.text_encoder.to(device)
-        context = self.encode_text(data["prompt"], device)
-        if self.offload_frozen:
-            self.text_encoder.to("cpu")
-            torch.cuda.empty_cache()
+        # 1. Encode text (precomputed or live)
+        if "precomputed_text_emb" in data:
+            context = data["precomputed_text_emb"].to(device, dtype=self.dtype)
+            # Ensure shape is [1, 512, 4096] — keep full padded length to match live path
+            if context.dim() == 2:
+                context = context.unsqueeze(0)
+        else:
+            if self.offload_frozen:
+                self.text_encoder.to(device)
+            context = self.encode_text(data["prompt"], device)
+            if self.offload_frozen:
+                self.text_encoder.to("cpu")
+                torch.cuda.empty_cache()
         self._log_vram("after-text-encode")
 
         # 2. Encode audio (precomputed or live)
@@ -799,6 +822,8 @@ class OmniAvatarV2VTrainingModule(nn.Module):
                        or self.trepa_func is not None)
         if use_any_aux:
             self._log_vram("before-aux-losses")
+            mse_loss_val = loss.detach()  # Save before aux losses modify it
+
             sigma = self.scheduler.sigmas[timestep_id].to(
                 device=device, dtype=noise_pred.dtype
             )
@@ -835,11 +860,12 @@ class OmniAvatarV2VTrainingModule(nn.Module):
                 + trepa_loss * self.aux_trepa_weight
             )
 
+            # Store as detached tensors — .item() deferred to logging time
             self._last_aux_losses = {
-                "mse": F.mse_loss(noise_pred.float(), training_target.float()).detach().item(),
-                "sync": sync_loss.detach().item(),
-                "lpips": lpips_loss.detach().item(),
-                "trepa": trepa_loss.detach().item(),
+                "mse": mse_loss_val,
+                "sync": sync_loss.detach(),
+                "lpips": lpips_loss.detach(),
+                "trepa": trepa_loss.detach(),
             }
 
         # 10. Timestep weighting
@@ -1031,9 +1057,10 @@ def load_syncnet(args):
     if not getattr(args, "compute_sync_metrics", False):
         return None, None
     try:
+        # SyncNet is in Self-Forcing_LipSync_StableAvatar, not DiffSynth-Studio
         diffsynth_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "DiffSynth-Studio",
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+            "Self-Forcing_LipSync_StableAvatar",
         )
         if diffsynth_path not in sys.path:
             sys.path.insert(0, diffsynth_path)
@@ -1179,9 +1206,11 @@ def save_checkpoint(accelerator, model, output_path, step_or_name, train_args):
 # ============================================================================
 
 def launch_training(dataset, model, args):
+    # Extend NCCL timeout to 2 hours for long validation runs
+    pg_kwargs = InitProcessGroupKwargs(timeout=timedelta(hours=2))
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
-        kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)],
+        kwargs_handlers=[pg_kwargs],
     )
 
     optimizer = torch.optim.AdamW(
@@ -1196,6 +1225,8 @@ def launch_training(dataset, model, args):
     dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=1, shuffle=True, collate_fn=collate_fn,
         num_workers=args.num_workers,
+        pin_memory=True,
+        persistent_workers=(args.num_workers > 0),
     )
 
     model, optimizer, dataloader, lr_scheduler = accelerator.prepare(
@@ -1372,7 +1403,7 @@ def launch_training(dataset, model, args):
                             uw = accelerator.unwrap_model(model)
                             if uw._last_aux_losses:
                                 for k, v in uw._last_aux_losses.items():
-                                    log_dict[f"aux/{k}"] = v
+                                    log_dict[f"aux/{k}"] = v.item() if hasattr(v, 'item') else v
                             wandb.log(log_dict, step=global_step)
                         except Exception as e:
                             print(f"[W&B] log error: {e}")
@@ -1443,6 +1474,8 @@ def train_parser():
                         help="Load precomputed VAE latents from vae_latents.pt")
     parser.add_argument("--use_precomputed_audio", action="store_true",
                         help="Load precomputed audio from audio_emb_omniavatar.pt")
+    parser.add_argument("--use_precomputed_text_emb", action="store_true",
+                        help="Load precomputed T5 text embeddings from text_emb.pt")
     parser.add_argument("--num_frames", type=int, default=81)
     parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--width", type=int, default=512)
@@ -1587,8 +1620,9 @@ if __name__ == "__main__":
         latentsync_mask_path=args.latentsync_mask_path,
         use_precomputed_vae=args.use_precomputed_vae,
         use_precomputed_audio=args.use_precomputed_audio,
+        use_precomputed_text_emb=args.use_precomputed_text_emb,
     )
-    print(f"[Dataset] {len(dataset)} samples (precomputed_vae={args.use_precomputed_vae}, precomputed_audio={args.use_precomputed_audio})")
+    print(f"[Dataset] {len(dataset)} samples (precomputed_vae={args.use_precomputed_vae}, precomputed_audio={args.use_precomputed_audio}, precomputed_text={args.use_precomputed_text_emb})")
 
     # Model
     model = OmniAvatarV2VTrainingModule(

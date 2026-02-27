@@ -69,7 +69,7 @@ OmniAvatar/                          # Root
 - **I2V metadata**: `test_metadata.csv` (in repo root, 3 test samples for smoke tests)
 - **V2V training**: `/home/work/stableavatar_data/v2v_training_data/` (29K videos)
   - Path list: `video_square_path.txt` (one directory per line)
-  - Each dir has: `sub_clip.mp4`, `audio.wav`, `prompt.txt`, `vae_latents.pt`, `audio_emb_omniavatar.pt`
+  - Each dir has: `sub_clip.mp4`, `audio.wav`, `prompt.txt`, `vae_latents.pt`, `audio_emb_omniavatar.pt`, `text_emb.pt`
 - **V2V validation**: `/home/work/stableavatar_data/v2v_validation_data/{recon,mixed}/`
   - Recon: 10 samples (same identity video + audio), Mixed: 12 samples (cross-identity)
 - **LatentSync mask**: `/home/work/.local/Self-Forcing_LipSync_StableAvatar/diffsynth/utils/mask.png`
@@ -105,7 +105,8 @@ CUDA_VISIBLE_DEVICES=0 /home/work/.local/miniconda3/envs/omniavatar/bin/accelera
   --num_processes 1 --mixed_precision bf16 scripts/train_v2v.py \
   [model paths] --data_list_path /path/to/video_square_path.txt \
   --latentsync_mask_path /path/to/mask.png \
-  --use_precomputed_vae --use_precomputed_audio --use_gradient_checkpointing
+  --use_precomputed_vae --use_precomputed_audio --use_precomputed_text_emb \
+  --use_gradient_checkpointing
 
 # Precompute OmniAvatar audio embeddings (2 GPUs parallel)
 CUDA_VISIBLE_DEVICES=0 python scripts/precompute_audio_omniavatar.py \
@@ -221,6 +222,8 @@ StableSyncNet, melspectrogram (audio.py), TREPALoss, lpips pip package
   `in_dim=49` in args singleton (vs 33 for I2V train.py).
 - **Precomputed data**: `vae_latents.pt` from StableAvatar (compatible Wan VAE),
   `audio_emb_omniavatar.pt` from our precompute script (10752-dim, NOT StableAvatar's 768-dim).
+- **Precomputed text**: `text_emb.pt` from StableAvatar preprocessing (same T5 model, [1, 512, 4096]).
+  `--use_precomputed_text_emb` skips T5 loading entirely — saves ~250-450ms/step with offloading.
 - **Patch embedding expansion**: OmniAvatar ckpt has 33ch, model is 49ch. Constructor
   handles expansion: copies 33ch weights, leaves channels 33-48 xavier-initialized.
 - **LatentSync mask**: 256x256 PNG (255=keep upper face, 0=mask mouth). Resized to latent
@@ -235,8 +238,10 @@ StableSyncNet, melspectrogram (audio.py), TREPALoss, lpips pip package
 | With aux losses | 30 GB | 11 GB | 0.6 GB | 3.7 GB | ~100 GB | **~146 GB** |
 | Aux + offload_frozen | 30 GB | CPU | 0.6 GB | 3.7 GB | ~100 GB | **~134 GB** |
 
-- **`--offload_frozen` required with aux losses** — offloads T5 (11.36 GB) + Wav2Vec (0.38 GB)
-  to CPU. VAE stays on GPU (0.26 GB, needed for backward through aux losses).
+- **`--offload_frozen` required with aux losses (unless precomputed text+audio)** — offloads
+  T5 (11.36 GB) + Wav2Vec (0.38 GB) to CPU. VAE stays on GPU (0.26 GB, needed for backward
+  through aux losses). With precomputed text+audio, `--offload_frozen` is unnecessary — T5
+  and Wav2Vec2 are never loaded to GPU, saving per-step offloading overhead.
 - **VAE decode is the VRAM spike**: decoding 21 latent frames → 81 RGB@512x512 costs ~50 GB.
 - **`--verbose_vram`**: prints VRAM at each stage of forward pass for debugging.
 
@@ -269,6 +274,17 @@ StableSyncNet, melspectrogram (audio.py), TREPALoss, lpips pip package
   Skip chunks with fewer than chunk_size frames.
 - **VAE `requires_grad_(False)` does NOT block gradient flow** — it only prevents gradient
   accumulation on VAE params. Autograd still flows through for aux loss backprop to DiT.
+- **Don't use `find_unused_parameters=True` in DDP** — unnecessary for our LoRA+audio setup
+  (condition dropout zeros inputs but modules still execute). Adds expensive autograd graph
+  traversal after every backward. DiffSynth defaults to False; StableAvatar doesn't use it.
+- **Avoid `.item()` in forward()** — each call forces CUDA synchronization. Store as
+  `.detach()` tensors, call `.item()` only at logging time.
+- **Use precomputed text with `--offload_frozen`** — without precomputed text, T5 (11 GB)
+  transfers GPU↔CPU every step plus `empty_cache()`. Biggest fixable perf bottleneck.
+- **xfuser conflicts with Flash Attention 3** — xfuser registers simplified flash_attn_3
+  operators that break real FA3 ("expected 3 arguments but received 32"). Import
+  `flash_attn_interface` BEFORE xfuser. Training (sp_size=1) uses FA3; multi-GPU
+  inference (sp_size>1) falls back to FA2 automatically.
 
 ## Model Configurations
 
