@@ -164,10 +164,15 @@ class OmniAvatarV2VDataset(torch.utils.data.Dataset):
         else:
             result["prompt"] = "a person is talking"
 
-        # Audio path (for aux losses that need raw audio)
+        # Raw audio for aux losses (loaded here by DataLoader workers, not in forward())
         audio_wav_path = os.path.join(video_dir, "audio.wav")
         if os.path.exists(audio_wav_path):
             result["audio_path"] = audio_wav_path
+            audio_np, _ = librosa.load(audio_wav_path, sr=self.sample_rate)
+            target_samples = int(self.num_frames / 25 * self.sample_rate)
+            if len(audio_np) > target_samples:
+                audio_np = audio_np[:target_samples]
+            result["audio"] = audio_np
 
         result["video_dir"] = video_dir
         return result
@@ -1424,7 +1429,7 @@ def launch_training(dataset, model, args):
             consecutive_nones = 0
 
             with accelerator.accumulate(model):
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 loss = model(data)
                 accelerator.backward(loss)
                 if args.max_grad_norm > 0:
