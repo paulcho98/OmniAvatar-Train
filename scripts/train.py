@@ -38,7 +38,8 @@ from tqdm import tqdm
 from PIL import Image
 from peft import LoraConfig, inject_adapter_in_model
 from accelerate import Accelerator
-from accelerate.utils import DistributedDataParallelKwargs
+from accelerate.utils import InitProcessGroupKwargs
+from datetime import timedelta
 import torchvision.transforms as transforms
 from transformers import Wav2Vec2FeatureExtractor
 
@@ -630,14 +631,18 @@ class OmniAvatarTrainingModule(nn.Module):
         )
         self._log_vram("after-dit-forward")
 
-        # 8. Flow matching MSE loss
+        # 8. Flow matching MSE loss with timestep weighting
+        # Apply timestep weight to MSE ONLY (not aux losses) — matching StableAvatar
         loss = F.mse_loss(noise_pred.float(), training_target.float())
+        loss = loss * self.scheduler.training_weight(timestep)
 
         # 9. Auxiliary losses on decoded x_0 (SyncNet, LPIPS, TREPA)
         use_any_aux = (self.syncnet is not None or self.lpips_func is not None
                        or self.trepa_func is not None)
         if use_any_aux:
             self._log_vram("before-aux-losses")
+            mse_loss_val = loss.detach()  # Save before combining
+
             sigma = self.scheduler.sigmas[timestep_id].to(
                 device=device, dtype=noise_pred.dtype
             )
@@ -668,7 +673,7 @@ class OmniAvatarTrainingModule(nn.Module):
             if self.trepa_func is not None and pred_rgb.shape[2] >= 16:
                 trepa_loss = self._compute_trepa_loss(pred_rgb, gt_rgb)
 
-            # Combine: weighted sum replaces raw MSE
+            # Combine: timestep-weighted MSE + unweighted aux losses
             loss = (
                 loss * self.aux_recon_weight
                 + sync_loss * self.aux_sync_weight
@@ -676,16 +681,14 @@ class OmniAvatarTrainingModule(nn.Module):
                 + trepa_loss * self.aux_trepa_weight
             )
 
-            # Store for wandb logging
+            # Store as detached tensors — .item() deferred to logging time
             self._last_aux_losses = {
-                "mse": F.mse_loss(noise_pred.float(), training_target.float()).detach().item(),
-                "sync": sync_loss.detach().item(),
-                "lpips": lpips_loss.detach().item(),
-                "trepa": trepa_loss.detach().item(),
+                "mse": mse_loss_val,
+                "sync": sync_loss.detach(),
+                "lpips": lpips_loss.detach(),
+                "trepa": trepa_loss.detach(),
             }
 
-        # 10. Apply timestep weighting
-        loss = loss * self.scheduler.training_weight(timestep)
         return loss
 
 
@@ -978,9 +981,11 @@ def save_checkpoint(accelerator, model, output_path, step_or_name, train_args):
 
 def launch_training(dataset, model, args):
     """Main training loop with Accelerate, wandb, gradient accumulation, validation."""
+    # Extend NCCL timeout to 2 hours for long validation runs
+    pg_kwargs = InitProcessGroupKwargs(timeout=timedelta(hours=2))
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
-        kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)],
+        kwargs_handlers=[pg_kwargs],
     )
 
     optimizer = torch.optim.AdamW(
@@ -1132,11 +1137,11 @@ def launch_training(dataset, model, args):
                 optimizer.step()
 
                 with torch.no_grad():
-                    ga_loss_sum += loss.item()
+                    ga_loss_sum += loss.detach()
                     ga_loss_count += 1
 
                 if accelerator.sync_gradients:
-                    step_loss = ga_loss_sum / max(1, ga_loss_count)
+                    step_loss = (ga_loss_sum / max(1, ga_loss_count)).item()
                     ga_loss_sum = ga_loss_count = 0.0
                     global_step += 1
 
@@ -1167,7 +1172,7 @@ def launch_training(dataset, model, args):
                             uw = accelerator.unwrap_model(model)
                             if uw._last_aux_losses:
                                 for k, v in uw._last_aux_losses.items():
-                                    log_dict[f"aux/{k}"] = v
+                                    log_dict[f"aux/{k}"] = v.item() if hasattr(v, 'item') else v
                             wandb.log(log_dict, step=global_step)
                         except Exception as e:
                             print(f"[W&B] log error: {e}")

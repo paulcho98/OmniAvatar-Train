@@ -813,8 +813,10 @@ class OmniAvatarV2VTrainingModule(nn.Module):
         )
         self._log_vram("after-dit-forward")
 
-        # 8. Flow matching MSE loss
+        # 8. Flow matching MSE loss with timestep weighting
+        # Apply timestep weight to MSE ONLY (not aux losses) — matching StableAvatar
         loss = F.mse_loss(noise_pred.float(), training_target.float())
+        loss = loss * self.scheduler.training_weight(timestep)
 
         # 9. Auxiliary losses on decoded x_0
         T_lat = input_latents.shape[2]
@@ -822,7 +824,7 @@ class OmniAvatarV2VTrainingModule(nn.Module):
                        or self.trepa_func is not None)
         if use_any_aux:
             self._log_vram("before-aux-losses")
-            mse_loss_val = loss.detach()  # Save before aux losses modify it
+            mse_loss_val = loss.detach()  # Save before combining
 
             sigma = self.scheduler.sigmas[timestep_id].to(
                 device=device, dtype=noise_pred.dtype
@@ -853,6 +855,7 @@ class OmniAvatarV2VTrainingModule(nn.Module):
             if self.trepa_func is not None and pred_rgb.shape[2] >= 16:
                 trepa_loss = self._compute_trepa_loss(pred_rgb, gt_rgb)
 
+            # Combine: timestep-weighted MSE + unweighted aux losses
             loss = (
                 loss * self.aux_recon_weight
                 + sync_loss * self.aux_sync_weight
@@ -866,11 +869,9 @@ class OmniAvatarV2VTrainingModule(nn.Module):
                 "sync": sync_loss.detach(),
                 "lpips": lpips_loss.detach(),
                 "trepa": trepa_loss.detach(),
-                "total": loss.detach(),  # pre-timestep-weighting; differs from loss/step by timestep weight
+                "total": loss.detach(),
             }
 
-        # 10. Timestep weighting
-        loss = loss * self.scheduler.training_weight(timestep)
         return loss
 
 
@@ -1431,11 +1432,11 @@ def launch_training(dataset, model, args):
                 optimizer.step()
 
                 with torch.no_grad():
-                    ga_loss_sum += loss.item()
+                    ga_loss_sum += loss.detach()
                     ga_loss_count += 1
 
                 if accelerator.sync_gradients:
-                    step_loss = ga_loss_sum / max(1, ga_loss_count)
+                    step_loss = (ga_loss_sum / max(1, ga_loss_count)).item()
                     ga_loss_sum = ga_loss_count = 0.0
                     global_step += 1
 
