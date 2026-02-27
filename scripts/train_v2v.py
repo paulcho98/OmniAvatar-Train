@@ -866,6 +866,7 @@ class OmniAvatarV2VTrainingModule(nn.Module):
                 "sync": sync_loss.detach(),
                 "lpips": lpips_loss.detach(),
                 "trepa": trepa_loss.detach(),
+                "total": loss.detach(),  # pre-timestep-weighting; differs from loss/step by timestep weight
             }
 
         # 10. Timestep weighting
@@ -1293,6 +1294,49 @@ def launch_training(dataset, model, args):
     if accelerator.is_main_process:
         syncnet, syncnet_detector = load_syncnet(args)
 
+    # --- Loss tracking ---
+    # Note: ema_loss and accumulators are NOT restored on resume (same as StableAvatar).
+    # Wandb dashboard will show a discontinuity at the resume point.
+    ema_loss = None
+    ema_beta = 0.99
+    window_loss_sum = window_loss_count = 0.0
+    cum_loss_sum = cum_loss_count = 0.0
+    ga_loss_sum = ga_loss_count = 0.0
+    global_step = 0
+    first_epoch = 0
+
+    # --- Resume from checkpoint ---
+    if args.resume_from_checkpoint:
+        if args.resume_from_checkpoint != "latest":
+            ckpt_path = args.resume_from_checkpoint
+        else:
+            # Find the most recent checkpoint-N directory
+            dirs = [
+                d for d in os.listdir(args.output_path)
+                if d.startswith("checkpoint-")
+            ] if os.path.isdir(args.output_path) else []
+            if dirs:
+                dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
+                ckpt_path = os.path.join(args.output_path, dirs[-1])
+            else:
+                ckpt_path = None
+
+        if ckpt_path is None or not os.path.isdir(ckpt_path):
+            accelerator.print(
+                f"[Resume] Checkpoint '{args.resume_from_checkpoint}' not found. Starting fresh."
+            )
+        else:
+            accelerator.print(f"[Resume] Loading state from {ckpt_path}")
+            accelerator.load_state(ckpt_path)
+            global_step = int(os.path.basename(ckpt_path).split("-")[1])
+            num_update_steps_per_epoch = math.ceil(
+                len(dataloader) / args.gradient_accumulation_steps
+            )
+            first_epoch = global_step // num_update_steps_per_epoch
+            accelerator.print(
+                f"[Resume] Resuming from step {global_step}, epoch {first_epoch}"
+            )
+
     # --- wandb ---
     use_wandb = getattr(args, "use_wandb", False) and accelerator.is_main_process
     if use_wandb:
@@ -1301,31 +1345,33 @@ def launch_training(dataset, model, args):
             api_key = getattr(args, "wandb_api_key", None)
             if api_key:
                 wandb.login(key=api_key, relogin=True)
+            # Determine run ID: explicit arg > saved in checkpoint > None (new run)
+            # Use --wandb_fresh_run to force a new run even when resuming training
+            wandb_run_id = getattr(args, "wandb_run_id", None)
+            if wandb_run_id is None and global_step > 0 and not getattr(args, "wandb_fresh_run", False):
+                # Resuming from checkpoint — try to load saved wandb run ID
+                wandb_id_path = os.path.join(
+                    args.output_path, f"checkpoint-{global_step}", "wandb_id.txt"
+                )
+                if os.path.isfile(wandb_id_path):
+                    with open(wandb_id_path) as f:
+                        wandb_run_id = f.read().strip()
+                    print(f"[W&B] Loaded saved run ID from checkpoint: {wandb_run_id}")
+            wandb_config = {k: v for k, v in vars(args).items() if k != "wandb_api_key"}
             wandb.init(
                 project=getattr(args, "wandb_project", "OmniAvatar-V2V"),
                 entity=getattr(args, "wandb_entity", None),
-                name=getattr(args, "wandb_run_name", None),
+                name=getattr(args, "wandb_run_name", None) or os.path.basename(args.output_path),
                 tags=args.wandb_tags.split(",") if getattr(args, "wandb_tags", None) else None,
-                config={
-                    "learning_rate": args.learning_rate,
-                    "gradient_accumulation_steps": args.gradient_accumulation_steps,
-                    "lora_rank": args.lora_rank, "lora_alpha": args.lora_alpha,
-                    "num_frames": args.num_frames, "height": args.height, "width": args.width,
-                    "model": "OmniAvatar-V2V-14B", "in_dim": 49,
-                },
+                config=wandb_config,
+                id=wandb_run_id,
+                resume="allow" if wandb_run_id else None,
+                dir=args.output_path,
             )
             print(f"[W&B] Initialized: {wandb.run.id}")
         except Exception as e:
             print(f"[W&B] Init failed: {e}")
             use_wandb = False
-
-    # --- Loss tracking ---
-    ema_loss = None
-    ema_beta = 0.99
-    window_loss_sum = window_loss_count = 0.0
-    cum_loss_sum = cum_loss_count = 0.0
-    ga_loss_sum = ga_loss_count = 0.0
-    global_step = 0
 
     # --- Validation at step 0 ---
     if getattr(args, "validate_at_start", False) and accelerator.is_main_process and has_val_samples:
@@ -1345,9 +1391,24 @@ def launch_training(dataset, model, args):
 
     # --- Training loop ---
     consecutive_nones = 0
-    for epoch_id in range(args.num_epochs):
+    # Number of batches to skip in the first resumed epoch
+    resume_batches_to_skip = 0
+    if global_step > 0 and first_epoch < args.num_epochs:
+        resume_batches_to_skip = (global_step - first_epoch * math.ceil(
+            len(dataloader) / args.gradient_accumulation_steps
+        )) * args.gradient_accumulation_steps
+        accelerator.print(f"[Resume] Skipping {resume_batches_to_skip} batches in epoch {first_epoch}")
+
+    for epoch_id in range(first_epoch, args.num_epochs):
+        # Skip already-processed batches when resuming mid-epoch
+        if epoch_id == first_epoch and resume_batches_to_skip > 0:
+            active_dataloader = accelerator.skip_first_batches(dataloader, resume_batches_to_skip)
+            resume_batches_to_skip = 0  # only skip once
+        else:
+            active_dataloader = dataloader
+
         epoch_pbar = tqdm(
-            dataloader, desc=f"Epoch {epoch_id + 1}/{args.num_epochs}",
+            active_dataloader, desc=f"Epoch {epoch_id + 1}/{args.num_epochs}",
             disable=not accelerator.is_main_process,
         )
 
@@ -1410,6 +1471,29 @@ def launch_training(dataset, model, args):
                         window_loss_sum = window_loss_count = 0.0
 
                     if args.save_steps and global_step % args.save_steps == 0:
+                        # Full training state — all ranks must participate (collective op)
+                        ckpt_dir = os.path.join(args.output_path, f"checkpoint-{global_step}")
+                        os.makedirs(ckpt_dir, exist_ok=True)
+                        accelerator.save_state(ckpt_dir)
+                        if accelerator.is_main_process:
+                            # Save wandb run ID for seamless resume
+                            if use_wandb:
+                                import wandb
+                                with open(os.path.join(ckpt_dir, "wandb_id.txt"), "w") as f:
+                                    f.write(wandb.run.id)
+                            print(f"[Checkpoint] Saved accelerator state to {ckpt_dir}")
+                            # Rotate old checkpoints (save-then-rotate for crash safety)
+                            if args.checkpoints_total_limit is not None:
+                                checkpoints = [
+                                    d for d in os.listdir(args.output_path)
+                                    if d.startswith("checkpoint-") and d != f"checkpoint-{global_step}"
+                                ]
+                                checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
+                                while len(checkpoints) >= args.checkpoints_total_limit:
+                                    old_ckpt = checkpoints.pop(0)
+                                    shutil.rmtree(os.path.join(args.output_path, old_ckpt))
+                                    print(f"[Checkpoint] Removed old checkpoint: {old_ckpt}")
+                        # LoRA-only weights (for inference)
                         save_checkpoint(accelerator, model, args.output_path, global_step, args)
 
                     lr_scheduler.step()
@@ -1437,14 +1521,25 @@ def launch_training(dataset, model, args):
                                 syncnet, syncnet_detector, use_wandb,
                             )
 
-    # Final checkpoint
+    # Final checkpoint — all ranks must participate (collective op)
+    ckpt_dir = os.path.join(args.output_path, f"checkpoint-{global_step}")
+    if not os.path.isdir(ckpt_dir):  # skip if periodic save already created it
+        os.makedirs(ckpt_dir, exist_ok=True)
+        accelerator.save_state(ckpt_dir)
+        if accelerator.is_main_process:
+            if use_wandb:
+                import wandb
+                with open(os.path.join(ckpt_dir, "wandb_id.txt"), "w") as f:
+                    f.write(wandb.run.id)
+            print(f"[Checkpoint] Saved final accelerator state to {ckpt_dir}")
     save_checkpoint(accelerator, model, args.output_path, f"final-{global_step}", args)
 
     if use_wandb:
         try:
             import wandb
             wandb.summary["final/loss_ema"] = ema_loss
-            wandb.summary["final/total_steps"] = global_step
+            wandb.summary["final/loss_cum_mean"] = cum_loss_sum / max(1, cum_loss_count)
+            wandb.summary["final/global_step"] = global_step
             wandb.finish()
         except Exception:
             pass
@@ -1514,6 +1609,10 @@ def train_parser():
     # Checkpoint
     parser.add_argument("--output_path", type=str, default="./checkpoints/omniavatar-v2v-14b")
     parser.add_argument("--save_steps", type=int, default=None)
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
+                        help="Path to an accelerator checkpoint dir, or 'latest' to auto-detect.")
+    parser.add_argument("--checkpoints_total_limit", type=int, default=None,
+                        help="Max number of accelerator checkpoints to keep. Oldest removed first.")
 
     # Wandb
     parser.add_argument("--use_wandb", action="store_true", default=False)
@@ -1523,6 +1622,10 @@ def train_parser():
     parser.add_argument("--wandb_tags", type=str, default=None)
     parser.add_argument("--wandb_api_key", type=str, default=None)
     parser.add_argument("--wandb_log_every", type=int, default=10)
+    parser.add_argument("--wandb_run_id", type=str, default=None,
+                        help="Wandb run ID to resume logging into an existing run.")
+    parser.add_argument("--wandb_fresh_run", action="store_true", default=False,
+                        help="Force a new wandb run even when resuming from checkpoint.")
 
     # Validation — V2V specific (recon + mixed)
     parser.add_argument("--val_data_recon", type=str, default=None,
