@@ -1112,6 +1112,9 @@ def run_v2v_validation_loop(model, val_samples, prefix, args, global_step, devic
                             syncnet=None, syncnet_detector=None, use_wandb=False):
     """Run V2V validation on preloaded samples, log to wandb with prefix."""
     unwrapped = model
+    # Save validation videos persistently under output_path/val_videos/
+    val_save_dir = os.path.join(args.output_path, "val_videos", f"step_{global_step}", prefix)
+    os.makedirs(val_save_dir, exist_ok=True)
     val_temp_dir = tempfile.mkdtemp(prefix=f"val_v2v_{prefix}_")
     val_videos = []
     sync_d_list, sync_c_list = [], []
@@ -1134,6 +1137,10 @@ def run_v2v_validation_loop(model, val_samples, prefix, args, global_step, devic
                 mux_video_with_audio(generated_frames, audio_path, video_path, fps=25)
             else:
                 save_video_frames(generated_frames, video_path, fps=25)
+
+            # Save a persistent copy
+            persistent_path = os.path.join(val_save_dir, f"{sample['name']}.mp4")
+            shutil.copy2(video_path, persistent_path)
 
             # SyncNet metrics
             sync_d, sync_c = None, None
@@ -1173,6 +1180,7 @@ def run_v2v_validation_loop(model, val_samples, prefix, args, global_step, devic
             print(f"[Validation/{prefix}] wandb log error: {e}")
 
     shutil.rmtree(val_temp_dir, ignore_errors=True)
+    print(f"[Validation/{prefix}] Videos saved to {val_save_dir}")
 
 
 # ============================================================================
@@ -1206,6 +1214,111 @@ def save_checkpoint(accelerator, model, output_path, step_or_name, train_args):
         }
         with open(os.path.join(output_path, "config.json"), "w") as f:
             json.dump(config, f, indent=4)
+
+
+def save_training_state(accelerator, model, optimizer, lr_scheduler, ckpt_dir, train_args):
+    """Save lean training state: trainable weights + optimizer + scheduler + RNG.
+
+    Collective op — all ranks must call (barrier + per-rank RNG save).
+    Replaces accelerator.save_state() to avoid saving the full 14B model (~45 GB → ~3.6 GB).
+    """
+    import pickle
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    # 1. Trainable model weights (main process only)
+    if accelerator.is_main_process:
+        state_dict = accelerator.get_state_dict(model)
+        unwrapped = accelerator.unwrap_model(model)
+        trainable_sd = unwrapped.export_trainable_state_dict(
+            state_dict, remove_prefix="pipe.dit.",
+        )
+        torch.save(trainable_sd, os.path.join(ckpt_dir, "trainable_weights.pt"))
+        print(f"[Checkpoint] Saved {len(trainable_sd)} trainable params "
+              f"({sum(v.numel() for v in trainable_sd.values()) / 1e6:.1f}M parameters)")
+
+    # 2. Optimizer state (main process only) — already only has trainable param states
+    if accelerator.is_main_process:
+        raw_opt = optimizer.optimizer if hasattr(optimizer, 'optimizer') else optimizer
+        torch.save(raw_opt.state_dict(), os.path.join(ckpt_dir, "optimizer.pt"))
+
+    # 3. LR scheduler state (main process only)
+    if accelerator.is_main_process:
+        raw_sched = lr_scheduler.scheduler if hasattr(lr_scheduler, 'scheduler') else lr_scheduler
+        torch.save(raw_sched.state_dict(), os.path.join(ckpt_dir, "scheduler.pt"))
+
+    # 4. RNG states (each rank saves its own)
+    rng_state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.random.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        rng_state["torch_cuda"] = torch.cuda.get_rng_state(accelerator.device)
+    with open(os.path.join(ckpt_dir, f"random_states_{accelerator.process_index}.pkl"), "wb") as f:
+        pickle.dump(rng_state, f)
+
+    # 5. Metadata (main process only)
+    if accelerator.is_main_process:
+        step_str = os.path.basename(ckpt_dir).split("-")[-1]
+        metadata = {"format": "lean_v1", "global_step": int(step_str)}
+        with open(os.path.join(ckpt_dir, "metadata.json"), "w") as f:
+            json.dump(metadata, f, indent=2)
+
+    # Barrier: all ranks finish writing before anyone proceeds
+    accelerator.wait_for_everyone()
+
+
+def load_training_state(accelerator, model, optimizer, lr_scheduler, ckpt_dir):
+    """Load lean training state: trainable weights + optimizer + scheduler + RNG.
+
+    Collective op — all ranks must call (per-rank RNG restore + barrier).
+    Replaces accelerator.load_state().
+    """
+    import pickle
+
+    # 1. Trainable model weights
+    weights_path = os.path.join(ckpt_dir, "trainable_weights.pt")
+    trainable_sd = torch.load(weights_path, map_location="cpu", weights_only=True)
+    # Re-add "pipe.dit." prefix stripped during save
+    prefixed_sd = {f"pipe.dit.{k}": v for k, v in trainable_sd.items()}
+    unwrapped = accelerator.unwrap_model(model)
+    missing, unexpected = unwrapped.load_state_dict(prefixed_sd, strict=False)
+    if accelerator.is_main_process:
+        print(f"[Resume] Loaded {len(prefixed_sd)} trainable params from checkpoint")
+        if unexpected:
+            print(f"[Resume] WARNING: {len(unexpected)} unexpected keys")
+
+    # 2. Optimizer state
+    opt_path = os.path.join(ckpt_dir, "optimizer.pt")
+    opt_sd = torch.load(opt_path, map_location="cpu", weights_only=True)
+    raw_opt = optimizer.optimizer if hasattr(optimizer, 'optimizer') else optimizer
+    raw_opt.load_state_dict(opt_sd)
+    if accelerator.is_main_process:
+        print(f"[Resume] Loaded optimizer state ({len(opt_sd['state'])} param states)")
+
+    # 3. LR scheduler state
+    sched_path = os.path.join(ckpt_dir, "scheduler.pt")
+    sched_sd = torch.load(sched_path, map_location="cpu", weights_only=True)
+    raw_sched = lr_scheduler.scheduler if hasattr(lr_scheduler, 'scheduler') else lr_scheduler
+    raw_sched.load_state_dict(sched_sd)
+
+    # 4. RNG states (each rank loads its own)
+    rng_path = os.path.join(ckpt_dir, f"random_states_{accelerator.process_index}.pkl")
+    if os.path.isfile(rng_path):
+        with open(rng_path, "rb") as f:
+            rng_state = pickle.load(f)
+        random.setstate(rng_state["python"])
+        np.random.set_state(rng_state["numpy"])
+        torch.random.set_rng_state(rng_state["torch_cpu"])
+        if "torch_cuda" in rng_state and torch.cuda.is_available():
+            torch.cuda.set_rng_state(rng_state["torch_cuda"], accelerator.device)
+        if accelerator.is_main_process:
+            print(f"[Resume] Restored RNG states for {accelerator.num_processes} processes")
+    else:
+        if accelerator.is_main_process:
+            print(f"[Resume] WARNING: No RNG state at {rng_path}")
+
+    accelerator.wait_for_everyone()
 
 
 # ============================================================================
@@ -1333,7 +1446,14 @@ def launch_training(dataset, model, args):
             )
         else:
             accelerator.print(f"[Resume] Loading state from {ckpt_path}")
-            accelerator.load_state(ckpt_path)
+            # Detect format: lean (trainable_weights.pt) vs legacy (model.safetensors)
+            if os.path.isfile(os.path.join(ckpt_path, "trainable_weights.pt")):
+                load_training_state(
+                    accelerator, model, optimizer, lr_scheduler, ckpt_path,
+                )
+            else:
+                accelerator.print("[Resume] Legacy checkpoint — using accelerator.load_state")
+                accelerator.load_state(ckpt_path)
             global_step = int(os.path.basename(ckpt_path).split("-")[1])
             num_update_steps_per_epoch = math.ceil(
                 len(dataloader) / args.gradient_accumulation_steps
@@ -1477,17 +1597,18 @@ def launch_training(dataset, model, args):
                         window_loss_sum = window_loss_count = 0.0
 
                     if args.save_steps and global_step % args.save_steps == 0:
-                        # Full training state — all ranks must participate (collective op)
+                        # Lean training state — all ranks must participate (collective op)
                         ckpt_dir = os.path.join(args.output_path, f"checkpoint-{global_step}")
-                        os.makedirs(ckpt_dir, exist_ok=True)
-                        accelerator.save_state(ckpt_dir)
+                        save_training_state(
+                            accelerator, model, optimizer, lr_scheduler, ckpt_dir, args,
+                        )
                         if accelerator.is_main_process:
                             # Save wandb run ID for seamless resume
                             if use_wandb:
                                 import wandb
                                 with open(os.path.join(ckpt_dir, "wandb_id.txt"), "w") as f:
                                     f.write(wandb.run.id)
-                            print(f"[Checkpoint] Saved accelerator state to {ckpt_dir}")
+                            print(f"[Checkpoint] Saved lean training state to {ckpt_dir}")
                             # Rotate old checkpoints (save-then-rotate for crash safety)
                             if args.checkpoints_total_limit is not None:
                                 checkpoints = [
@@ -1531,14 +1652,15 @@ def launch_training(dataset, model, args):
     # Final checkpoint — all ranks must participate (collective op)
     ckpt_dir = os.path.join(args.output_path, f"checkpoint-{global_step}")
     if not os.path.isdir(ckpt_dir):  # skip if periodic save already created it
-        os.makedirs(ckpt_dir, exist_ok=True)
-        accelerator.save_state(ckpt_dir)
+        save_training_state(
+            accelerator, model, optimizer, lr_scheduler, ckpt_dir, args,
+        )
         if accelerator.is_main_process:
             if use_wandb:
                 import wandb
                 with open(os.path.join(ckpt_dir, "wandb_id.txt"), "w") as f:
                     f.write(wandb.run.id)
-            print(f"[Checkpoint] Saved final accelerator state to {ckpt_dir}")
+            print(f"[Checkpoint] Saved final lean training state to {ckpt_dir}")
     save_checkpoint(accelerator, model, args.output_path, f"final-{global_step}", args)
 
     if use_wandb:
@@ -1617,9 +1739,9 @@ def train_parser():
     parser.add_argument("--output_path", type=str, default="./checkpoints/omniavatar-v2v-14b")
     parser.add_argument("--save_steps", type=int, default=None)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None,
-                        help="Path to an accelerator checkpoint dir, or 'latest' to auto-detect.")
+                        help="Path to a checkpoint dir (lean or legacy format), or 'latest' to auto-detect.")
     parser.add_argument("--checkpoints_total_limit", type=int, default=None,
-                        help="Max number of accelerator checkpoints to keep. Oldest removed first.")
+                        help="Max number of training checkpoints to keep. Oldest removed first.")
 
     # Wandb
     parser.add_argument("--use_wandb", action="store_true", default=False)
