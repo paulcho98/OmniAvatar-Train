@@ -1512,6 +1512,7 @@ def launch_training(dataset, model, args):
                         and has_val_samples
                     ):
                         print(f"\n[Validation] Running at step {global_step}...")
+                        torch.cuda.empty_cache()
                         unwrapped = accelerator.unwrap_model(model)
                         val_device = next(unwrapped.dit.parameters()).device
                         if val_recon_samples:
