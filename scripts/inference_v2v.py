@@ -278,21 +278,6 @@ def load_video_frames(video_path, num_frames=81, target_size=(512, 512)):
     return np.stack(frames, axis=0)  # [N, H, W, 3] uint8
 
 
-def apply_spatial_mask(frames_np, mask_np):
-    """Apply LatentSync mask: frame 0 untouched, frames 1+ have mouth zeroed.
-
-    Args:
-        frames_np: [N, H, W, 3] uint8
-        mask_np: [H, W] float32, 1=keep, 0=mask (LatentSync convention)
-    Returns:
-        masked_frames_np: [N, H, W, 3] uint8
-    """
-    masked = frames_np.copy()
-    for i in range(1, len(masked)):
-        masked[i] = (masked[i].astype(np.float32) * mask_np[:, :, None]).astype(np.uint8)
-    return masked
-
-
 def frames_to_video_tensor(frames_np):
     """Convert [N, H, W, 3] uint8 numpy to [1, 3, N, H, W] float [-1, 1] tensor."""
     t = torch.from_numpy(frames_np).float() / 255.0  # [N, H, W, 3] in [0, 1]
@@ -300,6 +285,26 @@ def frames_to_video_tensor(frames_np):
     t = t * 2.0 - 1.0  # [-1, 1]
     t = t.unsqueeze(0).permute(0, 2, 1, 3, 4)  # [1, 3, N, H, W]
     return t
+
+
+def apply_spatial_mask_normalized(video_tensor, mask_np):
+    """Apply LatentSync mask in normalized [-1,1] space.
+
+    Matches StableAvatar's precompute_vae_latents.py: normalize first, then
+    mask. Masked region becomes 0.0 in [-1,1] space (mid-gray), NOT -1.0
+    (black). The model was trained on precomputed data with this convention.
+
+    Args:
+        video_tensor: [1, 3, N, H, W] float in [-1, 1]
+        mask_np: [H, W] float32, 1=keep, 0=mask (LatentSync convention)
+    Returns:
+        masked_tensor: [1, 3, N, H, W] float in [-1, 1], mouth region = 0.0
+    """
+    mask_t = torch.from_numpy(mask_np).float()  # [H, W]
+    mask_t = mask_t[None, None, None, :, :]  # [1, 1, 1, H, W] — broadcast over B, C, N
+    masked = video_tensor.clone()
+    masked[:, :, 1:, :, :] *= mask_t  # Frame 0 untouched, frames 1+ masked
+    return masked
 
 
 def load_latentsync_mask(mask_path, latent_h, latent_w):
@@ -564,11 +569,11 @@ class WanV2VInferencePipeline(nn.Module):
         mask_pixel = np.array(mask_img.resize((W, H), Image.LANCZOS)).astype(np.float32) / 255.0
         mask_pixel_binary = (mask_pixel > 0.5).astype(np.float32)
 
-        masked_frames_np = apply_spatial_mask(frames_np, mask_pixel_binary)
-
-        # --- 3. Convert to tensors and VAE-encode ---
+        # --- 3. Normalize to [-1,1], THEN apply mask, then VAE-encode ---
+        # Must match precomputed training data: normalize first, mask second.
+        # Masked region becomes 0.0 in [-1,1] space (mid-gray), NOT -1.0 (black).
         video_tensor = frames_to_video_tensor(frames_np)  # [1, 3, N, H, W] float [-1, 1]
-        masked_video_tensor = frames_to_video_tensor(masked_frames_np)
+        masked_video_tensor = apply_spatial_mask_normalized(video_tensor, mask_pixel_binary)
 
         self.pipe.load_models_to_device(['vae'])
 
