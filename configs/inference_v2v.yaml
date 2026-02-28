@@ -1,0 +1,64 @@
+# V2V inference config for OmniAvatar lip sync
+# Usage:
+#   torchrun --standalone --nproc_per_node=1 scripts/inference_v2v.py \
+#     --config configs/inference_v2v.yaml --input_file examples/v2v_samples.txt
+#
+# Input file format (@@-delimited): prompt@@video_path@@audio_path
+#
+# For LatentSync mode (arbitrary-resolution video with face detection + compositing):
+#   torchrun --standalone --nproc_per_node=1 scripts/inference_v2v.py \
+#     --config configs/inference_v2v.yaml --input_file examples/v2v_samples.txt \
+#     -hp latentsync_inference=true
+
+dtype: "bf16"
+text_encoder_path: pretrained_models/Wan2.1-T2V-14B/models_t5_umt5-xxl-enc-bf16.pth
+image_encoder_path: None
+dit_path: pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00001-of-00006.safetensors,pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00002-of-00006.safetensors,pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00003-of-00006.safetensors,pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00004-of-00006.safetensors,pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00005-of-00006.safetensors,pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00006-of-00006.safetensors
+vae_path: pretrained_models/Wan2.1-T2V-14B/Wan2.1_VAE.pth
+wav2vec_path: pretrained_models/wav2vec2-base-960h
+
+# Checkpoint — set exp_path to your V2V training output directory.
+# The config.json there (from train_v2v.py) sets in_dim=49, v2v=True, etc.
+# If your checkpoint is step-500.pt (not pytorch_model.pt), set ckpt_name accordingly.
+exp_path: checkpoints/omniavatar-v2v  # V2V training output directory (must contain config.json)
+ckpt_name: pytorch_model.pt          # or step-500.pt etc.
+reload_cfg: True
+
+# LatentSync mask (mouth region) — ships with our repo
+latentsync_mask_path: OmniAvatar/utils/latentsync/mask.png
+
+# LatentSync face detection (only used when latentsync_inference=true)
+latentsync_inference: false
+insightface_model_dir: checkpoints/auxiliary  # must contain models/buffalo_l/
+face_detection_cache_dir:
+use_mouth_only_compositing: false
+save_aligned_video: false
+
+# Output directory (optional — auto-generated if not set)
+output_dir:
+
+# SyncNet evaluation metrics
+compute_sync_metrics: false
+syncnet_model_path: checkpoints/auxiliary/syncnet_v2.model
+s3fd_model_path: checkpoints/auxiliary/sfd_face.pth
+
+num_persistent_param_in_dit:
+sp_size: 1
+
+# Generation parameters
+seed: 42
+num_frames: 81
+guidance_scale: 4.5
+num_steps: 25
+fps: 25
+sample_rate: 16000
+negative_prompt: "Vivid color tones, background/camera moving quickly, screen switching, subtitles and special effects, mutation, overexposed, static, blurred details, subtitles, style, work, painting, image, still, overall grayish, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, malformed limbs, fingers merging, motionless image, chaotic background, three legs, crowded background with many people, walking backward"
+
+# These are unused in V2V single-pass but parse_args may expect them
+use_fsdp: False
+tea_cache_l1_thresh: 0
+silence_duration_s: 0
+max_hw: 720
+max_tokens: 6272
+seq_len: 81
+overlap_frame: 13
