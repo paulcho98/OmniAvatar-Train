@@ -486,8 +486,16 @@ class WanV2VInferencePipeline(nn.Module):
 
     @torch.no_grad()
     def encode_audio(self, audio_path, num_frames):
-        """Encode audio → [1, num_frames, 10752] float tensor."""
+        """Encode audio → [1, num_frames, 10752] float tensor.
+
+        Matches training's precompute pipeline: encode at the FULL audio's
+        natural frame count (seq_len = total_audio_frames), then slice to
+        num_frames. This preserves the temporal grid that the model was
+        trained on. Encoding directly at seq_len=num_frames would produce
+        a different linear_interpolation grid in Wav2Vec2.
+        """
         wav2vec_sr = 16000  # Wav2Vec2 native sample rate
+        fps = self.args.fps
         audio, sr = librosa.load(audio_path, sr=wav2vec_sr)
         input_values = np.squeeze(
             self.wav_feature_extractor(audio, sampling_rate=wav2vec_sr).input_values
@@ -495,20 +503,27 @@ class WanV2VInferencePipeline(nn.Module):
         input_values = torch.from_numpy(input_values).float().to(device=self.device)
         input_values = input_values.unsqueeze(0)
 
-        # Pad audio to match video frame count
-        samples_per_frame = wav2vec_sr // self.args.fps  # 640 at 16kHz/25fps
-        target_samples = num_frames * samples_per_frame
+        # Compute the full audio's natural frame count (matches precompute script)
+        samples_per_frame = wav2vec_sr // fps  # 640 at 16kHz/25fps
+        total_audio_frames = math.ceil(input_values.shape[1] / samples_per_frame)
+        total_audio_frames = max(total_audio_frames, num_frames)  # at least num_frames
+
+        # Pad to align with total_audio_frames
+        target_samples = total_audio_frames * samples_per_frame
         if input_values.shape[1] < target_samples:
             input_values = F.pad(input_values, (0, target_samples - input_values.shape[1]))
-        elif input_values.shape[1] > target_samples:
-            input_values = input_values[:, :target_samples]
 
+        # Encode at full length, then slice — matches training precompute + slice pattern
         hidden_states = self.audio_encoder(
-            input_values, seq_len=num_frames, output_hidden_states=True
+            input_values, seq_len=total_audio_frames, output_hidden_states=True
         )
         audio_emb = hidden_states.last_hidden_state
         for hs in hidden_states.hidden_states:
             audio_emb = torch.cat((audio_emb, hs), -1)
+        # audio_emb: [1, total_audio_frames, 10752]
+
+        # Slice to num_frames (matches training: full_emb[:num_training_frames])
+        audio_emb = audio_emb[:, :num_frames, :]
         return audio_emb  # [1, num_frames, 10752]
 
     @torch.no_grad()
