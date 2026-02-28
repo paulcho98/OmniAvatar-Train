@@ -653,12 +653,15 @@ def load_syncnet(args, output_dir):
     if not getattr(args, "compute_sync_metrics", False):
         return None, None
     try:
-        diffsynth_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-            "Self-Forcing_LipSync_StableAvatar",
-        )
-        if diffsynth_path not in sys.path:
-            sys.path.insert(0, diffsynth_path)
+        syncnet_repo_path = getattr(args, "syncnet_repo_path", None)
+        if syncnet_repo_path is None:
+            # Default: look for Self-Forcing_LipSync_StableAvatar as sibling of repo root
+            syncnet_repo_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                "Self-Forcing_LipSync_StableAvatar",
+            )
+        if syncnet_repo_path not in sys.path:
+            sys.path.insert(0, syncnet_repo_path)
         from diffsynth.models.syncnet import SyncNetEval, SyncNetDetector
         syncnet_model_path = getattr(args, "syncnet_model_path", None)
         s3fd_model_path = getattr(args, "s3fd_model_path", None)
@@ -682,12 +685,7 @@ def load_syncnet(args, output_dir):
 def run_syncnet_eval(syncnet, detector, video_path, temp_dir):
     """Run SyncNet evaluation on a video with audio."""
     try:
-        diffsynth_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "DiffSynth-Studio",
-        )
-        if diffsynth_path not in sys.path:
-            sys.path.insert(0, diffsynth_path)
+        # syncnet_eval is in the same repo as SyncNetEval (already on sys.path from load_syncnet)
         from diffsynth.models.syncnet import syncnet_eval
         syncnet_temp = os.path.join(temp_dir, "syncnet_eval")
         os.makedirs(syncnet_temp, exist_ok=True)

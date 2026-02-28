@@ -39,6 +39,7 @@ output_dir:
 
 # SyncNet evaluation metrics
 compute_sync_metrics: false
+syncnet_repo_path:                                    # path to Self-Forcing_LipSync_StableAvatar repo (has diffsynth.models.syncnet)
 syncnet_model_path: checkpoints/auxiliary/syncnet_v2.model
 s3fd_model_path: checkpoints/auxiliary/sfd_face.pth
 
