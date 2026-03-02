@@ -18,6 +18,7 @@ Usage:
 
 import argparse, os, sys, cv2, subprocess, torch, numpy as np
 from pathlib import Path
+from PIL import Image
 from tqdm import tqdm
 import torchvision.transforms.functional as TF_v
 
@@ -48,23 +49,37 @@ def parse_args():
     p.add_argument("--fps", type=int, default=25)
     p.add_argument("--resolution", type=int, default=512,
                    help="Resolution of generated (aligned) face videos")
+    p.add_argument("--mask_path",
+                   default="/home/work/.local/Self-Forcing_LipSync_StableAvatar/diffsynth/utils/mask.png",
+                   help="LatentSync mouth mask (255=keep upper face, 0=generate mouth)")
     p.add_argument("--device", default="cuda:0")
     return p.parse_args()
 
 
-def read_video_frames(path, num_frames):
-    """Read up to num_frames from video, pad last frame if short."""
+def read_video_frames(path, max_frames=None):
+    """Read frames from video. If max_frames given, read at most that many."""
     cap = cv2.VideoCapture(str(path))
     frames = []
-    for _ in range(num_frames):
+    while True:
+        if max_frames is not None and len(frames) >= max_frames:
+            break
         ret, frame = cap.read()
         if not ret:
             break
         frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     cap.release()
-    while len(frames) < num_frames:
-        frames.append(frames[-1].copy())
     return frames
+
+
+def load_mouth_mask(mask_path, resolution):
+    """Load LatentSync mouth mask. Returns tensor [1, resolution, resolution].
+    Convention: 1.0 = keep original (upper face), 0.0 = use generated (mouth).
+    """
+    mask = np.array(Image.open(mask_path).convert("L").resize(
+        (resolution, resolution), Image.LANCZOS
+    ))
+    mask = torch.from_numpy(mask).float() / 255.0  # [H, W], 1=keep, 0=generate
+    return mask.unsqueeze(0)  # [1, H, W]
 
 
 def build_name_mapping(generated_dir, original_videos_dir):
@@ -129,25 +144,40 @@ def load_face_cache(face_cache_dir, stem, resolution, existing_face_cache_dir=No
     return None
 
 
-def composite_single_video(gen_path, original_path, face_cache, restorer, num_frames):
+def composite_single_video(gen_path, original_path, face_cache, restorer, mouth_mask):
     """Composite generated face video back onto original frames.
+
+    Uses mouth-only mask: blends generated mouth region with original upper face
+    before inverse affine transform onto the original frame. Frame count is
+    determined by the generated video (no padding).
 
     Replicates logic from inference_v2v.py:composite_with_latentsync (lines 185-252).
     """
-    gen_frames = read_video_frames(str(gen_path), num_frames)
-    orig_frames = read_video_frames(str(original_path), num_frames)
+    gen_frames = read_video_frames(str(gen_path))  # actual frame count from generated
+    orig_frames = read_video_frames(str(original_path))
 
     boxes = face_cache["boxes"]
     affine_matrices = face_cache["affine_matrices"]
+    aligned_faces = face_cache.get("aligned_faces")
     composite_frames = []
 
-    for i in range(min(len(gen_frames), len(orig_frames))):
+    num_frames = len(gen_frames)  # trim to generated count
+    for i in range(min(num_frames, len(orig_frames), len(boxes))):
         if boxes[i] is None:
             composite_frames.append(orig_frames[i])
             continue
 
         # HWC uint8 -> CHW tensor
         face_tensor = torch.from_numpy(gen_frames[i]).permute(2, 0, 1)
+
+        # Mouth-only compositing: blend generated mouth with original upper face
+        if aligned_faces is not None and mouth_mask is not None:
+            original_aligned = aligned_faces[i]  # [C, 512, 512] uint8
+            # mouth_mask: 1=keep original (upper face), 0=use generated (mouth)
+            face_tensor = (
+                face_tensor.float() * (1.0 - mouth_mask) +
+                original_aligned.float() * mouth_mask
+            ).to(torch.uint8)
 
         # Resize generated face to match bounding box size
         x1, y1, x2, y2 = boxes[i]
@@ -203,6 +233,10 @@ def main():
     # Initialize AlignRestore (only needs kornia, no InsightFace)
     restorer = AlignRestore(align_points=3, resolution=args.resolution, device=args.device)
 
+    # Load LatentSync mouth mask
+    mouth_mask = load_mouth_mask(args.mask_path, args.resolution)
+    print(f"Loaded mouth mask from {args.mask_path} ({mouth_mask.shape})")
+
     # Build mapping: generated -> original
     mapping = build_name_mapping(args.generated_dir, args.original_videos_dir)
     print(f"Found {len(mapping)} videos to composite")
@@ -224,9 +258,9 @@ def main():
             print(f"  SKIP: no face cache for {stem}")
             continue
 
-        # Composite
+        # Composite (mouth-only mask, trimmed to generated frame count)
         frames = composite_single_video(
-            gen_path, orig_path, cache, restorer, args.num_frames
+            gen_path, orig_path, cache, restorer, mouth_mask
         )
 
         # Save with audio
