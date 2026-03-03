@@ -6,7 +6,7 @@ OmniAvatar is an audio-driven portrait animation model built on Wan 2.1. Only in
 is published. **Our objective is to reconstruct the training code** by bridging OmniAvatar's
 inference-only codebase with DiffSynth-Studio's training infrastructure.
 
-**We are working with the 14B model.** The training code must produce identical forward-pass
+**We work with both 14B and 1.3B models.** The training code must produce identical forward-pass
 behavior to inference, with gradients flowing correctly through all components.
 
 ## Workflow & Session Rules
@@ -14,7 +14,7 @@ behavior to inference, with gradients flowing correctly through all components.
 - **Context management**: Compact when context reaches ~60%. Use subagents (Task tool
   with Explore type) for all code exploration to keep the main context clean.
 - **Environment**: `conda activate omniavatar`
-- **GPUs**: We have GPUs 0 and 1 available. Use `CUDA_VISIBLE_DEVICES=0,1`.
+- **GPUs**: We have GPUs 0–3 available. Use `CUDA_VISIBLE_DEVICES=0,1,2,3`.
 - **Write scope**: Full read/write access to everything within this repo
   (`/home/work/.local/OmniAvatar/`). Do NOT write to files outside this repo.
 - **Version control**: Commit and push after verified large changes so we can always
@@ -56,8 +56,12 @@ OmniAvatar/                          # Root
 ├── scripts/train.py                 # I2V training script (Accelerate + LoRA + wandb)
 ├── scripts/train_v2v.py             # V2V lip sync training (49ch input, spatial mask)
 ├── scripts/precompute_audio_omniavatar.py  # Audio precomputation (10752-dim embeddings)
-├── scripts/train_v2v_auxloss.sh     # Launch script for V2V training with aux losses
+├── scripts/train_v2v_auxloss.sh     # Launch script for V2V training with aux losses (2 GPU)
+├── scripts/train_v2v_auxloss_4gpus.sh  # 4-GPU variant (14B)
+├── scripts/train_v2v_1.3B.sh       # 1.3B V2V training (4 GPU, mask_all_frames)
+├── scripts/inference_v2v.py        # V2V inference (single-pass, no chunking)
 ├── scripts/inference_modified.py    # Modified inference (no zero audio prefix, matches training)
+├── scripts/precompute_vae_latents_masked.py  # Precompute vae_latents_mask_all.pt for --mask_all_frames
 ├── configs/                         # YAML configs (inference_1.3B.yaml, etc.)
 ├── examples/                        # Sample input files
 └── docs/                            # Reference documentation
@@ -70,6 +74,7 @@ OmniAvatar/                          # Root
 - **V2V training**: `/home/work/stableavatar_data/v2v_training_data/` (29K videos)
   - Path list: `video_square_path.txt` (one directory per line)
   - Each dir has: `sub_clip.mp4`, `audio.wav`, `prompt.txt`, `vae_latents.pt`, `audio_emb_omniavatar.pt`, `text_emb.pt`
+  - Optional: `vae_latents_mask_all.pt` (frame 0 also masked, for `--mask_all_frames`)
 - **V2V validation**: `/home/work/stableavatar_data/v2v_validation_data/{recon,mixed}/`
   - Recon: 10 samples (same identity video + audio), Mixed: 12 samples (cross-identity)
 - **LatentSync mask**: `/home/work/.local/Self-Forcing_LipSync_StableAvatar/diffsynth/utils/mask.png`
@@ -97,7 +102,13 @@ CUDA_VISIBLE_DEVICES=0,1 /home/work/.local/miniconda3/envs/omniavatar/bin/accele
 ## Running V2V Training
 
 ```bash
-# V2V with aux losses (single GPU, precomputed data)
+# V2V 14B with aux losses (4 GPUs, grad_accum=2, effective batch=8)
+bash scripts/train_v2v_auxloss_4gpus.sh
+
+# V2V 1.3B with aux losses + mask_all_frames (4 GPUs)
+bash scripts/train_v2v_1.3B.sh
+
+# V2V with aux losses (2 GPUs, legacy)
 bash scripts/train_v2v_auxloss.sh
 
 # V2V without aux losses (no offloading needed, ~61 GB peak)
@@ -107,6 +118,9 @@ CUDA_VISIBLE_DEVICES=0 /home/work/.local/miniconda3/envs/omniavatar/bin/accelera
   --latentsync_mask_path /path/to/mask.png \
   --use_precomputed_vae --use_precomputed_audio --use_precomputed_text_emb \
   --use_gradient_checkpointing
+
+# Precompute mask-all-frames VAE latents (4 GPUs, required before --mask_all_frames training)
+bash scripts/run_precompute_vae_masked.sh
 
 # Precompute OmniAvatar audio embeddings (2 GPUs parallel)
 CUDA_VISIBLE_DEVICES=0 python scripts/precompute_audio_omniavatar.py \
@@ -229,6 +243,9 @@ StableSyncNet, melspectrogram (audio.py), TREPALoss, lpips pip package
 - **LatentSync mask**: 256x256 PNG (255=keep upper face, 0=mask mouth). Resized to latent
   resolution (64x64) via bilinear interpolation + threshold. Inverted to OmniAvatar
   convention (0=keep, 1=generate) before use.
+- **Frame 0 handling** (default): frame 0 is treated as reference — mask channel=0 (keep all),
+  masked video untouched, latent overwritten at each denoising step. `--mask_all_frames`
+  and `--no_first_frame_overwrite` change this behavior independently.
 
 ## VRAM Budget (14B model, 512x512x81, single H200 150GB)
 
@@ -281,6 +298,14 @@ StableSyncNet, melspectrogram (audio.py), TREPALoss, lpips pip package
   `.detach()` tensors, call `.item()` only at logging time.
 - **Use precomputed text with `--offload_frozen`** — without precomputed text, T5 (11 GB)
   transfers GPU↔CPU every step plus `empty_cache()`. Biggest fixable perf bottleneck.
+- **VAE tiling causes color drift at 512x512** — `tiled=True` creates overlapping tiles with
+  blending at boundaries. At 512x512 (64x64 latent), the full spatial extent fits without
+  tiling. Use `tiled=False` for encode and decode in inference_v2v.py. The original I2V
+  inference.py uses different tile params via `log_video()` defaults.
+- **Batching is NOT supported** — entire training pipeline is hardcoded for batch_size=1.
+  Use `--gradient_accumulation_steps` for larger effective batch sizes.
+- **1.3B uses same VAE as 14B** — `Wan2.1_VAE.pth` is identical (507 MB). Audio modules
+  (`audio_hidden_size=32`) are also model-size-independent. Only DiT dims change.
 - **xfuser conflicts with Flash Attention 3** — xfuser registers simplified flash_attn_3
   operators that break real FA3 ("expected 3 arguments but received 32"). Import
   `flash_attn_interface` BEFORE xfuser. Training (sp_size=1) uses FA3; multi-GPU
