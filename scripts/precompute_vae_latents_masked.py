@@ -103,7 +103,8 @@ def main():
     model_manager.load_model(args.vae_path, device="cpu", torch_dtype=dtype)
     pipe = WanVideoPipeline.from_model_manager(model_manager, torch_dtype=dtype, device="cpu")
     vae = pipe.vae
-    print(f"[VAE] Loaded")
+    vae.to(device=device)
+    print(f"[VAE] Loaded on {device}")
 
     # Load mask
     mask_img = Image.open(args.latentsync_mask_path).convert("L")
