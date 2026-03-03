@@ -28,12 +28,12 @@ GPUS=(0 1 2 3)
 cd "$PROJECT_DIR"
 
 # ─── Dataset definitions ────────────────────────────────────────────────────
-# name|aligned_path|originals_video_dir|face_cache_dir
-# Note: metrics_originals are created as symlink dirs below (512x512 aligned)
+# name|data_path (has sub_clip.mp4, audio.wav, prompt.txt per sample)|face_cache_dir
+# These shared_data dirs contain the original videos + audio + face caches all in one place.
 DATASETS=(
-    "hdtf|/home/work/.local/StableAvatar/latentsync_eval_hdtf/aligned_data|/home/work/.local/HDTF/HDTF_original_testset_81frames/videos_cfr|/home/work/.local/StableAvatar/validation_hdtf/shared_hdtf_data/face_cache"
-    "hallo3|/home/work/.local/StableAvatar/latentsync_eval_hallo3/aligned_data|/home/work/.local/Hallo3_validation/validation_81frames/videos_cfr|/home/work/.local/StableAvatar/validation_hallo3/shared_hallo3_data/face_cache"
-    "hallo3_mixed|/home/work/.local/StableAvatar/validation_hallo3_mixed/shared_data||/home/work/.local/StableAvatar/validation_hallo3_mixed/shared_data/face_cache"
+    "hdtf|/home/work/.local/StableAvatar/validation_hdtf/shared_hdtf_data|/home/work/.local/StableAvatar/validation_hdtf/shared_hdtf_data/face_cache"
+    "hallo3|/home/work/.local/StableAvatar/validation_hallo3/shared_hallo3_data|/home/work/.local/StableAvatar/validation_hallo3/shared_hallo3_data/face_cache"
+    "hallo3_mixed|/home/work/.local/StableAvatar/validation_hallo3_mixed/shared_data|/home/work/.local/StableAvatar/validation_hallo3_mixed/shared_data/face_cache"
 )
 
 # ─── Combo definitions ──────────────────────────────────────────────────────
@@ -51,80 +51,38 @@ echo "=== Generating input files ==="
 mkdir -p "$INPUT_DIR"
 
 for entry in "${DATASETS[@]}"; do
-    IFS='|' read -r name aligned_path orig_video_dir face_cache <<< "$entry"
+    IFS='|' read -r name data_path face_cache <<< "$entry"
     input_file="$INPUT_DIR/${name}_latentsync.txt"
 
-    if [ -s "$input_file" ]; then
-        echo "  Reusing $input_file ($(wc -l < "$input_file") samples)"
-        continue
-    fi
-
+    # Always regenerate (paths may have changed)
     > "$input_file"
-
-    if [ "$name" = "hallo3_mixed" ]; then
-        # Mixed: video + audio in same directory
-        for dir in "$aligned_path"/v_*/; do
-            dir="${dir%/}"
-            [ -f "$dir/sub_clip.mp4" ] || continue
-            prompt="$(cat "$dir/prompt.txt" 2>/dev/null || echo "a person is talking")"
-            echo "${prompt}@@${dir}/sub_clip.mp4@@${dir}/audio.wav" >> "$input_file"
-        done
-    else
-        # hdtf/hallo3: video from originals, audio+prompt from aligned data
-        for dir in "$aligned_path"/*/; do
-            dir="${dir%/}"
-            sample="$(basename "$dir")"
-            [ -f "$dir/audio.wav" ] || continue
-            prompt="$(cat "$dir/prompt.txt" 2>/dev/null || echo "a person is talking")"
-            # Find matching full-res original
-            video=""
-            for candidate in "${orig_video_dir}/${sample}_cfr25.mp4" "${orig_video_dir}/${sample}.mp4"; do
-                if [ -f "$candidate" ]; then
-                    video="$candidate"
-                    break
-                fi
-            done
-            if [ -z "$video" ]; then
-                echo "  WARNING: no original for $sample, skipping"
-                continue
-            fi
-            echo "${prompt}@@${video}@@${dir}/audio.wav" >> "$input_file"
-        done
-    fi
-
+    for dir in "$data_path"/*/; do
+        dir="${dir%/}"
+        [ -f "$dir/sub_clip.mp4" ] || continue
+        [ -f "$dir/audio.wav" ] || continue
+        prompt="$(cat "$dir/prompt.txt" 2>/dev/null || echo "a person is talking")"
+        echo "${prompt}@@${dir}/sub_clip.mp4@@${dir}/audio.wav" >> "$input_file"
+    done
     echo "  Generated $input_file ($(wc -l < "$input_file") samples)"
 done
 
-# ─── Create metrics originals symlink dirs (512x512 aligned) ─────────────────
-# Composited output is 512x512, so metrics originals must match.
-# For hdtf/hallo3: symlink aligned sub_clip.mp4 with matching filenames.
-# For mixed: symlink sub_clip.mp4 from data dir.
+# ─── Create metrics originals symlink dirs ───────────────────────────────────
+# Flat dir of {sample_name}.mp4 → sub_clip.mp4 for metrics comparison.
 echo "  Creating metrics originals symlink dirs..."
 for entry in "${DATASETS[@]}"; do
-    IFS='|' read -r name aligned_path orig_video_dir face_cache <<< "$entry"
+    IFS='|' read -r name data_path face_cache <<< "$entry"
     orig_symdir="${OUTPUT_BASE}/originals/${name}"
     if [ -d "$orig_symdir" ] && [ "$(ls "$orig_symdir"/*.mp4 2>/dev/null | wc -l)" -gt 0 ]; then
         echo "    [SKIP] $name originals ($(ls "$orig_symdir"/*.mp4 | wc -l) files)"
         continue
     fi
     mkdir -p "$orig_symdir"
-
-    if [ "$name" = "hallo3_mixed" ]; then
-        for dir in "$aligned_path"/v_*/; do
-            dir="${dir%/}"
-            sample="$(basename "$dir")"
-            [ -f "$dir/sub_clip.mp4" ] || continue
-            ln -sf "$dir/sub_clip.mp4" "$orig_symdir/${sample}.mp4"
-        done
-    else
-        # hdtf/hallo3: aligned_data/{sample}/sub_clip.mp4 → {sample}.mp4
-        for dir in "$aligned_path"/*/; do
-            dir="${dir%/}"
-            sample="$(basename "$dir")"
-            [ -f "$dir/sub_clip.mp4" ] || continue
-            ln -sf "$dir/sub_clip.mp4" "$orig_symdir/${sample}.mp4"
-        done
-    fi
+    for dir in "$data_path"/*/; do
+        dir="${dir%/}"
+        sample="$(basename "$dir")"
+        [ -f "$dir/sub_clip.mp4" ] || continue
+        ln -sf "$dir/sub_clip.mp4" "$orig_symdir/${sample}.mp4"
+    done
     echo "    $name: $(ls "$orig_symdir"/*.mp4 2>/dev/null | wc -l) symlinks"
 done
 
@@ -135,7 +93,7 @@ JOBS=()
 for combo_entry in "${COMBOS[@]}"; do
     IFS='|' read -r label step cfg noffo <<< "$combo_entry"
     for ds_entry in "${DATASETS[@]}"; do
-        IFS='|' read -r ds_name aligned_path orig_video_dir face_cache <<< "$ds_entry"
+        IFS='|' read -r ds_name data_path face_cache <<< "$ds_entry"
         JOBS+=("${label}|${step}|${cfg}|${noffo}|${ds_name}|${face_cache}")
     done
 done
@@ -159,7 +117,11 @@ while [ $job_idx -lt $total ]; do
         input_file="${INPUT_DIR}/${ds_name}_latentsync.txt"
 
         # Skip if already done
-        existing=$(find "$out_dir" -name "*_composited_audio.mp4" 2>/dev/null | wc -l)
+        if [ -d "$out_dir" ]; then
+            existing=$(find "$out_dir" -name "*_composited_audio.mp4" 2>/dev/null | wc -l)
+        else
+            existing=0
+        fi
         if [ "$existing" -gt 0 ]; then
             echo "  [SKIP] ${label}/${ds_name} ($existing composited videos)"
             round_jobs+=("${label}|${ds_name}|${out_dir}")
@@ -227,7 +189,7 @@ METRIC_JOBS=()
 for combo_entry in "${COMBOS[@]}"; do
     IFS='|' read -r label step cfg noffo <<< "$combo_entry"
     for ds_entry in "${DATASETS[@]}"; do
-        IFS='|' read -r ds_name aligned_path orig_video_dir face_cache <<< "$ds_entry"
+        IFS='|' read -r ds_name data_path face_cache <<< "$ds_entry"
 
         comp_dir="${PROJECT_DIR}/${OUTPUT_BASE}/${label}/${ds_name}_composited"
         log_dir="${PROJECT_DIR}/${OUTPUT_BASE}/metrics/${label}/${ds_name}"
