@@ -68,15 +68,8 @@ def parse_args():
     args.device = f'cuda:{args.local_rank}'
     args.num_nodes = int(os.getenv("NNODES", "1"))
     debug = args.debug
-    if not os.path.exists(args.exp_path):
-        args.exp_path = f'checkpoints/{args.exp_path}'
 
-    if hasattr(args, 'reload_cfg') and args.reload_cfg:
-        # 重新加载配置文件
-        conf_path = os.path.join(args.exp_path, "config.json")
-        if os.path.exists(conf_path):
-            print('| Reloading config from:', conf_path)
-            args = reload(args, conf_path)
+    # Apply hparams BEFORE reload_cfg so -hp exp_path=... takes effect first
     if len(args.hparams) > 0:
         hp_dict = parse_hp_string(args.hparams)
         for key, value in hp_dict.items():
@@ -89,6 +82,16 @@ def parse_args():
                     setattr(args, key, ori_v)
                 else:
                     setattr(args, key, value)
+
+    if not os.path.exists(args.exp_path):
+        args.exp_path = f'checkpoints/{args.exp_path}'
+
+    if hasattr(args, 'reload_cfg') and args.reload_cfg:
+        # 重新加载配置文件
+        conf_path = os.path.join(args.exp_path, "config.json")
+        if os.path.exists(conf_path):
+            print('| Reloading config from:', conf_path)
+            args = reload(args, conf_path)
     args.debug = debug
     dict_args = convert_namespace_to_dict(args)
     if args.local_rank == 0:

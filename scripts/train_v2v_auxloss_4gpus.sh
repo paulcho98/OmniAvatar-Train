@@ -8,7 +8,7 @@
 
 export TOKENIZERS_PARALLELISM=false
 
-CUDA_VISIBLE_DEVICES=0,1 accelerate launch --config_file configs/accelerate_2gpus.yaml \
+CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file configs/accelerate_4gpus.yaml \
     scripts/train_v2v.py \
     --dit_paths "pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00001-of-00006.safetensors,pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00002-of-00006.safetensors,pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00003-of-00006.safetensors,pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00004-of-00006.safetensors,pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00005-of-00006.safetensors,pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00006-of-00006.safetensors" \
     --text_encoder_path pretrained_models/Wan2.1-T2V-14B/models_t5_umt5-xxl-enc-bf16.pth \
@@ -23,7 +23,7 @@ CUDA_VISIBLE_DEVICES=0,1 accelerate launch --config_file configs/accelerate_2gpu
     --num_frames 81 --height 512 --width 512 \
     --num_epochs 1000 \
     --learning_rate 5e-5 \
-    --gradient_accumulation_steps 4 \
+    --gradient_accumulation_steps 2 \
     --max_grad_norm 1 \
     --weight_decay 0.01 \
     --seed 42 \
@@ -48,11 +48,13 @@ CUDA_VISIBLE_DEVICES=0,1 accelerate launch --config_file configs/accelerate_2gpu
     --val_data_mixed /home/work/stableavatar_data/v2v_validation_data/mixed \
     --val_max_samples 4 \
     --val_num_inference_steps 25 \
-    --validation_steps 1000 \
+    --validation_steps 500 \
     --use_wandb \
     --wandb_entity "paulhcho" \
     --wandb_project "OmniAvatar-V2V" \
     --wandb_run_name "v2v_14B_auxloss" \
     --wandb_log_every 1 \
     --compute_sync_metrics \
-    --offload_frozen 
+    --offload_frozen
+    # --mask_all_frames \
+    # --no_first_frame_overwrite

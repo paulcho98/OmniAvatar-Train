@@ -287,7 +287,7 @@ def frames_to_video_tensor(frames_np):
     return t
 
 
-def apply_spatial_mask_normalized(video_tensor, mask_np):
+def apply_spatial_mask_normalized(video_tensor, mask_np, mask_all_frames=False):
     """Apply LatentSync mask in normalized [-1,1] space.
 
     Matches StableAvatar's precompute_vae_latents.py: normalize first, then
@@ -297,13 +297,17 @@ def apply_spatial_mask_normalized(video_tensor, mask_np):
     Args:
         video_tensor: [1, 3, N, H, W] float in [-1, 1]
         mask_np: [H, W] float32, 1=keep, 0=mask (LatentSync convention)
+        mask_all_frames: if True, mask ALL frames including frame 0
     Returns:
         masked_tensor: [1, 3, N, H, W] float in [-1, 1], mouth region = 0.0
     """
     mask_t = torch.from_numpy(mask_np).float()  # [H, W]
     mask_t = mask_t[None, None, None, :, :]  # [1, 1, 1, H, W] — broadcast over B, C, N
     masked = video_tensor.clone()
-    masked[:, :, 1:, :, :] *= mask_t  # Frame 0 untouched, frames 1+ masked
+    if mask_all_frames:
+        masked *= mask_t  # ALL frames masked
+    else:
+        masked[:, :, 1:, :, :] *= mask_t  # Frame 0 untouched, frames 1+ masked
     return masked
 
 
@@ -319,13 +323,14 @@ def load_latentsync_mask(mask_path, latent_h, latent_w):
     return (mask_resized > 0.5).float().squeeze(0).squeeze(0)  # [H_lat, W_lat]
 
 
-def prepare_v2v_y(ref_latent, masked_video_latents, latent_mask):
+def prepare_v2v_y(ref_latent, masked_video_latents, latent_mask, mask_all_frames=False):
     """Build 33-channel y tensor for V2V (from train_v2v.py:prepare_v2v_input).
 
     Args:
         ref_latent: [1, 16, 1, H, W]
         masked_video_latents: [1, 16, T, H, W]
         latent_mask: [H, W] (1=keep, 0=mask, LatentSync convention)
+        mask_all_frames: if True, apply spatial mask to ALL frames including frame 0
     Returns:
         y: [1, 33, T, H, W]
     """
@@ -339,8 +344,11 @@ def prepare_v2v_y(ref_latent, masked_video_latents, latent_mask):
     # OmniAvatar convention: 0=keep, 1=generate. Invert from LatentSync.
     inverted = 1.0 - latent_mask
     mask_ch = torch.zeros(1, 1, T_lat, H_lat, W_lat, device=device, dtype=dtype)
-    mask_ch[:, :, 0] = 0  # Frame 0: keep all (reference)
-    mask_ch[:, :, 1:] = inverted[None, None, None]
+    if mask_all_frames:
+        mask_ch[:, :, :] = inverted[None, None, None]  # ALL frames: spatial mask
+    else:
+        mask_ch[:, :, 0] = 0  # Frame 0: keep all (reference)
+        mask_ch[:, :, 1:] = inverted[None, None, None]
 
     return torch.cat([ref_repeated, mask_ch, masked_video_latents], dim=1)
 
@@ -406,6 +414,13 @@ class WanV2VInferencePipeline(nn.Module):
     def load_model(self):
         dist.init_process_group(backend="nccl", init_method="env://")
         from xfuser.core.distributed import initialize_model_parallel, init_distributed_environment
+        # xfuser registers simplified 3-arg flash_attn_3 stubs that break the real
+        # 32-arg interface. Reload flash_attn_interface to re-register the real ops.
+        try:
+            import importlib, flash_attn_interface
+            importlib.reload(flash_attn_interface)
+        except ModuleNotFoundError:
+            pass
         init_distributed_environment(rank=dist.get_rank(), world_size=dist.get_world_size())
         initialize_model_parallel(
             sequence_parallel_degree=args.sp_size,
@@ -538,6 +553,8 @@ class WanV2VInferencePipeline(nn.Module):
         num_steps = num_steps if num_steps is not None else self.args.num_steps
         negative_prompt = negative_prompt if negative_prompt is not None else self.args.negative_prompt
         guidance_scale = guidance_scale if guidance_scale is not None else self.args.guidance_scale
+        mask_all_frames = getattr(self.args, "mask_all_frames", False)
+        no_first_frame_overwrite = getattr(self.args, "no_first_frame_overwrite", False)
 
         H, W = 512, 512
         T_lat = (num_frames + 3) // 4  # latent temporal frames (81 → 21)
@@ -573,22 +590,22 @@ class WanV2VInferencePipeline(nn.Module):
         # Must match precomputed training data: normalize first, mask second.
         # Masked region becomes 0.0 in [-1,1] space (mid-gray), NOT -1.0 (black).
         video_tensor = frames_to_video_tensor(frames_np)  # [1, 3, N, H, W] float [-1, 1]
-        masked_video_tensor = apply_spatial_mask_normalized(video_tensor, mask_pixel_binary)
+        masked_video_tensor = apply_spatial_mask_normalized(video_tensor, mask_pixel_binary, mask_all_frames)
 
         self.pipe.load_models_to_device(['vae'])
 
         source_latents = self.pipe.encode_video(
-            video_tensor.to(dtype=self.dtype, device=self.device)
+            video_tensor.to(dtype=self.dtype, device=self.device), tiled=False
         ).to(self.device)  # [1, 16, T_lat, latent_h, latent_w]
 
         masked_video_latents = self.pipe.encode_video(
-            masked_video_tensor.to(dtype=self.dtype, device=self.device)
+            masked_video_tensor.to(dtype=self.dtype, device=self.device), tiled=False
         ).to(self.device)  # [1, 16, T_lat, latent_h, latent_w]
 
         # --- 4. Build V2V y tensor (33ch) ---
         ref_latent = source_latents[:, :, :1]  # [1, 16, 1, H, W]
         latent_mask = load_latentsync_mask(mask_path, latent_h, latent_w).to(self.device)
-        y = prepare_v2v_y(ref_latent, masked_video_latents, latent_mask)
+        y = prepare_v2v_y(ref_latent, masked_video_latents, latent_mask, mask_all_frames)
 
         # --- 5. Encode text (load to GPU, then offload after) ---
         self.pipe.load_models_to_device(['text_encoder'])
@@ -598,9 +615,15 @@ class WanV2VInferencePipeline(nn.Module):
         ) if guidance_scale != 1.0 else None
         self.pipe.load_models_to_device([])
 
-        # --- 6. Encode audio ---
-        audio_emb = self.encode_audio(audio_path, num_frames)
-        audio_emb = audio_emb.to(dtype=self.dtype, device=self.device)
+        # --- 6. Encode audio (precomputed if available) ---
+        audio_emb_path = os.path.join(os.path.dirname(video_path), "audio_emb_omniavatar.pt")
+        if os.path.exists(audio_emb_path):
+            audio_data = torch.load(audio_emb_path, map_location="cpu")
+            audio_emb = audio_data["audio_emb"][:num_frames]  # [num_frames, 10752]
+            audio_emb = audio_emb.unsqueeze(0).to(dtype=self.dtype, device=self.device)
+        else:
+            audio_emb = self.encode_audio(audio_path, num_frames)
+            audio_emb = audio_emb.to(dtype=self.dtype, device=self.device)
 
         # --- 7. Denoising loop (single-pass, matches train_v2v validation) ---
         # Clean latent for fixed-frame overwriting (frame 0 = reference)
@@ -611,7 +634,7 @@ class WanV2VInferencePipeline(nn.Module):
         ], dim=2)
 
         latents = torch.randn_like(lat)
-        fixed_frame = 1
+        fixed_frame = 0 if no_first_frame_overwrite else 1
 
         self.pipe.scheduler.set_timesteps(num_steps, shift=5.0)
         self.pipe.load_models_to_device(["dit"])
@@ -650,7 +673,7 @@ class WanV2VInferencePipeline(nn.Module):
         self.pipe.load_models_to_device(['vae'])
         old_device = self.pipe.device
         self.pipe.device = self.device
-        frames = self.pipe.decode_video(latents, tiled=True, tile_size=(34, 34), tile_stride=(18, 16))
+        frames = self.pipe.decode_video(latents, tiled=False)
         self.pipe.device = old_device
         self.pipe.load_models_to_device([])
 
@@ -790,8 +813,12 @@ def main():
 
         if dist.get_rank() == 0:
             os.makedirs(output_dir, exist_ok=True)
-            sample_name = os.path.splitext(os.path.basename(video_path))[0]
-            video_stem = f"result_{idx:03d}_{sample_name}"
+            file_name = os.path.splitext(os.path.basename(video_path))[0]
+            if file_name in ("sub_clip", "video"):
+                sample_name = os.path.basename(os.path.dirname(video_path))
+            else:
+                sample_name = file_name
+            video_stem = sample_name
 
             # Convert generated frames [T, C, H, W] float [0, 1] → [T, H, W, C] uint8
             generated_np = (frames.permute(0, 2, 3, 1).clamp(0, 1) * 255).byte().cpu().numpy()

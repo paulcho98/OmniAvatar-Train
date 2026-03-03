@@ -104,7 +104,8 @@ class OmniAvatarV2VDataset(torch.utils.data.Dataset):
                  sample_rate=16000, fps=25, repeat=1,
                  latentsync_mask_path=None,
                  use_precomputed_vae=False, use_precomputed_audio=False,
-                 use_precomputed_text_emb=False):
+                 use_precomputed_text_emb=False,
+                 mask_all_frames=False):
         self.num_frames = num_frames
         self.height = height
         self.width = width
@@ -114,6 +115,7 @@ class OmniAvatarV2VDataset(torch.utils.data.Dataset):
         self.use_precomputed_vae = use_precomputed_vae
         self.use_precomputed_audio = use_precomputed_audio
         self.use_precomputed_text_emb = use_precomputed_text_emb
+        self.mask_all_frames = mask_all_frames
 
         # Read video directories
         with open(data_list_path) as f:
@@ -135,7 +137,12 @@ class OmniAvatarV2VDataset(torch.utils.data.Dataset):
 
         # VAE latents
         if self.use_precomputed_vae:
-            vae_path = os.path.join(video_dir, "vae_latents.pt")
+            if self.mask_all_frames:
+                vae_path = os.path.join(video_dir, "vae_latents_mask_all.pt")
+                if not os.path.exists(vae_path):
+                    vae_path = os.path.join(video_dir, "vae_latents.pt")
+            else:
+                vae_path = os.path.join(video_dir, "vae_latents.pt")
             vae_data = torch.load(vae_path, map_location="cpu")
             result["precomputed_input_latents"] = vae_data["input_latents"]    # [16, 21, 64, 64]
             result["precomputed_masked_latents"] = vae_data["masked_latents"]  # [16, 21, 64, 64]
@@ -203,17 +210,20 @@ class OmniAvatarV2VDataset(torch.utils.data.Dataset):
         return frames
 
     def _apply_spatial_mask(self, frames):
-        """Apply LatentSync mask: frame 0 untouched, frames 1+ have mouth zeroed out."""
+        """Apply LatentSync mask. If mask_all_frames, mask ALL frames including frame 0."""
         if self.latentsync_mask is None:
             return frames
 
-        masked_frames = [frames[0]]  # Frame 0: full reference, untouched
         mask = self.latentsync_mask  # [H_mask, W_mask], 1=keep, 0=mask
+        start_idx = 0 if self.mask_all_frames else 1
+        masked_frames = []
 
-        for frame in frames[1:]:
+        for i, frame in enumerate(frames):
+            if i < start_idx:
+                masked_frames.append(frame)  # Frame 0: untouched (legacy behavior)
+                continue
             frame_np = np.array(frame).astype(np.float32)
             h, w = frame_np.shape[:2]
-            # Resize mask to frame resolution if needed
             if mask.shape[0] != h or mask.shape[1] != w:
                 mask_resized = F.interpolate(
                     mask.unsqueeze(0).unsqueeze(0), size=(h, w),
@@ -315,13 +325,17 @@ class OmniAvatarV2VTrainingModule(nn.Module):
                  use_gradient_checkpointing_offload=False,
                  latentsync_mask=None,
                  num_training_frames=81,
-                 dtype=torch.bfloat16):
+                 dtype=torch.bfloat16,
+                 mask_all_frames=False,
+                 no_first_frame_overwrite=False):
         super().__init__()
         self.dtype = dtype
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.use_gradient_checkpointing_offload = use_gradient_checkpointing_offload
         self.latentsync_mask = latentsync_mask  # [H_mask, W_mask], 1=keep, 0=mask
         self.num_training_frames = num_training_frames
+        self.mask_all_frames = mask_all_frames
+        self.no_first_frame_overwrite = no_first_frame_overwrite
 
         # --- 1. Load base models via ModelManager ---
         model_manager = ModelManager(device="cpu", infer=False)
@@ -566,8 +580,11 @@ class OmniAvatarV2VTrainingModule(nn.Module):
         # Invert LatentSync (1=keep→0, 0=mask→1): mouth becomes 1 (generate)
         inverted = 1.0 - latent_mask  # [H_lat, W_lat]
         mask_ch = torch.zeros(1, 1, T_lat, H_lat, W_lat, device=device, dtype=dtype)
-        mask_ch[:, :, 0] = 0  # Frame 0: keep all (reference frame)
-        mask_ch[:, :, 1:] = inverted[None, None, None]  # Frames 1+: spatial mask
+        if self.mask_all_frames:
+            mask_ch[:, :, :] = inverted[None, None, None]  # ALL frames: spatial mask
+        else:
+            mask_ch[:, :, 0] = 0  # Frame 0: keep all (reference frame)
+            mask_ch[:, :, 1:] = inverted[None, None, None]  # Frames 1+: spatial mask
 
         return torch.cat([ref_repeated, mask_ch, masked_video_latents], dim=1)  # [1, 33, T, H, W]
 
@@ -994,7 +1011,7 @@ def run_v2v_validation(model, sample, device, num_training_frames=81,
 
     # 6. Start from pure noise
     latents = torch.randn_like(lat)
-    fixed_frame = 1
+    fixed_frame = 0 if model.no_first_frame_overwrite else 1
 
     pipe.scheduler.set_timesteps(num_inference_steps, shift=5.0)
 
@@ -1700,6 +1717,10 @@ def train_parser():
                         help="Load precomputed audio from audio_emb_omniavatar.pt")
     parser.add_argument("--use_precomputed_text_emb", action="store_true",
                         help="Load precomputed T5 text embeddings from text_emb.pt")
+    parser.add_argument("--mask_all_frames", action="store_true", default=False,
+                        help="Apply spatial mask to ALL frames including frame 0 (default: frame 0 unmasked)")
+    parser.add_argument("--no_first_frame_overwrite", action="store_true", default=False,
+                        help="Disable fixed-frame overwrite of frame 0 during validation denoising")
     parser.add_argument("--num_frames", type=int, default=81)
     parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--width", type=int, default=512)
@@ -1853,6 +1874,7 @@ if __name__ == "__main__":
         use_precomputed_vae=args.use_precomputed_vae,
         use_precomputed_audio=args.use_precomputed_audio,
         use_precomputed_text_emb=args.use_precomputed_text_emb,
+        mask_all_frames=args.mask_all_frames,
     )
     print(f"[Dataset] {len(dataset)} samples (precomputed_vae={args.use_precomputed_vae}, precomputed_audio={args.use_precomputed_audio}, precomputed_text={args.use_precomputed_text_emb})")
 
@@ -1870,6 +1892,8 @@ if __name__ == "__main__":
         use_gradient_checkpointing_offload=args.use_gradient_checkpointing_offload,
         latentsync_mask=latentsync_mask,
         num_training_frames=args.num_frames,
+        mask_all_frames=args.mask_all_frames,
+        no_first_frame_overwrite=args.no_first_frame_overwrite,
     )
 
     total = sum(p.numel() for p in model.parameters())
