@@ -90,8 +90,11 @@ def preprocess_with_latentsync(video_path, image_processor, face_detection_cache
         return None
 
     try:
-        entry_dir_name = os.path.basename(os.path.dirname(video_path))
-        video_stem = entry_dir_name if entry_dir_name else os.path.splitext(os.path.basename(video_path))[0]
+        video_basename = os.path.splitext(os.path.basename(video_path))[0]
+        if video_basename in ("sub_clip", "video"):
+            video_stem = os.path.basename(os.path.dirname(video_path))
+        else:
+            video_stem = video_basename
         face_cache_path = os.path.join(face_detection_cache_dir, f"{video_stem}_face_cache.pt")
 
         face_cache_loaded = False

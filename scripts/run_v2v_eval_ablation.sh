@@ -19,6 +19,7 @@ INPUT_DIR="/tmp/v2v_eval_inputs"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 PYTHON="/home/work/.local/miniconda3/envs/omniavatar/bin/python"
+TORCHRUN="/home/work/.local/miniconda3/envs/omniavatar/bin/torchrun"
 CONDA_METRICS="/home/work/.local/miniconda3/envs/latentsync-metrics/bin"
 METRICS_REPO="/home/work/.local/latentsync-metrics"
 SHAPE_PRED="${METRICS_REPO}/shape_predictor_68_face_landmarks.dat"
@@ -27,11 +28,12 @@ GPUS=(0 1 2 3)
 cd "$PROJECT_DIR"
 
 # ─── Dataset definitions ────────────────────────────────────────────────────
-# name|aligned_path|originals_video_dir|face_cache_dir|metrics_originals_dir
+# name|aligned_path|originals_video_dir|face_cache_dir
+# Note: metrics_originals are created as symlink dirs below (512x512 aligned)
 DATASETS=(
-    "hdtf|/home/work/.local/StableAvatar/latentsync_eval_hdtf/aligned_data|/home/work/.local/HDTF/HDTF_original_testset_81frames/videos_cfr|/home/work/.local/StableAvatar/validation_hdtf/shared_hdtf_data/face_cache|/home/work/.local/HDTF/HDTF_original_testset_81frames/videos_cfr"
-    "hallo3|/home/work/.local/StableAvatar/latentsync_eval_hallo3/aligned_data|/home/work/.local/Hallo3_validation/validation_81frames/videos_cfr|/home/work/.local/StableAvatar/validation_hallo3/shared_hallo3_data/face_cache|/home/work/.local/Hallo3_validation/validation_81frames/videos_cfr"
-    "hallo3_mixed|/home/work/.local/StableAvatar/validation_hallo3_mixed/shared_data||/home/work/.local/StableAvatar/validation_hallo3_mixed/shared_data/face_cache|"
+    "hdtf|/home/work/.local/StableAvatar/latentsync_eval_hdtf/aligned_data|/home/work/.local/HDTF/HDTF_original_testset_81frames/videos_cfr|/home/work/.local/StableAvatar/validation_hdtf/shared_hdtf_data/face_cache"
+    "hallo3|/home/work/.local/StableAvatar/latentsync_eval_hallo3/aligned_data|/home/work/.local/Hallo3_validation/validation_81frames/videos_cfr|/home/work/.local/StableAvatar/validation_hallo3/shared_hallo3_data/face_cache"
+    "hallo3_mixed|/home/work/.local/StableAvatar/validation_hallo3_mixed/shared_data||/home/work/.local/StableAvatar/validation_hallo3_mixed/shared_data/face_cache"
 )
 
 # ─── Combo definitions ──────────────────────────────────────────────────────
@@ -49,7 +51,7 @@ echo "=== Generating input files ==="
 mkdir -p "$INPUT_DIR"
 
 for entry in "${DATASETS[@]}"; do
-    IFS='|' read -r name aligned_path orig_video_dir face_cache metrics_orig <<< "$entry"
+    IFS='|' read -r name aligned_path orig_video_dir face_cache <<< "$entry"
     input_file="$INPUT_DIR/${name}_latentsync.txt"
 
     if [ -s "$input_file" ]; then
@@ -93,19 +95,38 @@ for entry in "${DATASETS[@]}"; do
     echo "  Generated $input_file ($(wc -l < "$input_file") samples)"
 done
 
-# ─── Create originals symlink dir for hallo3_mixed metrics ───────────────────
-MIXED_ORIG="${OUTPUT_BASE}/originals/hallo3_mixed"
-if [ ! -d "$MIXED_ORIG" ] || [ "$(ls "$MIXED_ORIG"/*.mp4 2>/dev/null | wc -l)" -eq 0 ]; then
-    echo "  Creating mixed originals symlink dir: $MIXED_ORIG"
-    mkdir -p "$MIXED_ORIG"
-    for dir in /home/work/.local/StableAvatar/validation_hallo3_mixed/shared_data/v_*/; do
-        dir="${dir%/}"
-        sample="$(basename "$dir")"
-        [ -f "$dir/sub_clip.mp4" ] || continue
-        ln -sf "$dir/sub_clip.mp4" "$MIXED_ORIG/${sample}.mp4"
-    done
-    echo "  Created $(ls "$MIXED_ORIG"/*.mp4 2>/dev/null | wc -l) symlinks"
-fi
+# ─── Create metrics originals symlink dirs (512x512 aligned) ─────────────────
+# Composited output is 512x512, so metrics originals must match.
+# For hdtf/hallo3: symlink aligned sub_clip.mp4 with matching filenames.
+# For mixed: symlink sub_clip.mp4 from data dir.
+echo "  Creating metrics originals symlink dirs..."
+for entry in "${DATASETS[@]}"; do
+    IFS='|' read -r name aligned_path orig_video_dir face_cache <<< "$entry"
+    orig_symdir="${OUTPUT_BASE}/originals/${name}"
+    if [ -d "$orig_symdir" ] && [ "$(ls "$orig_symdir"/*.mp4 2>/dev/null | wc -l)" -gt 0 ]; then
+        echo "    [SKIP] $name originals ($(ls "$orig_symdir"/*.mp4 | wc -l) files)"
+        continue
+    fi
+    mkdir -p "$orig_symdir"
+
+    if [ "$name" = "hallo3_mixed" ]; then
+        for dir in "$aligned_path"/v_*/; do
+            dir="${dir%/}"
+            sample="$(basename "$dir")"
+            [ -f "$dir/sub_clip.mp4" ] || continue
+            ln -sf "$dir/sub_clip.mp4" "$orig_symdir/${sample}.mp4"
+        done
+    else
+        # hdtf/hallo3: aligned_data/{sample}/sub_clip.mp4 → {sample}.mp4
+        for dir in "$aligned_path"/*/; do
+            dir="${dir%/}"
+            sample="$(basename "$dir")"
+            [ -f "$dir/sub_clip.mp4" ] || continue
+            ln -sf "$dir/sub_clip.mp4" "$orig_symdir/${sample}.mp4"
+        done
+    fi
+    echo "    $name: $(ls "$orig_symdir"/*.mp4 2>/dev/null | wc -l) symlinks"
+done
 
 # ─── Build flat job list ─────────────────────────────────────────────────────
 echo ""
@@ -114,7 +135,7 @@ JOBS=()
 for combo_entry in "${COMBOS[@]}"; do
     IFS='|' read -r label step cfg noffo <<< "$combo_entry"
     for ds_entry in "${DATASETS[@]}"; do
-        IFS='|' read -r ds_name aligned_path orig_video_dir face_cache metrics_orig <<< "$ds_entry"
+        IFS='|' read -r ds_name aligned_path orig_video_dir face_cache <<< "$ds_entry"
         JOBS+=("${label}|${step}|${cfg}|${noffo}|${ds_name}|${face_cache}")
     done
 done
@@ -155,7 +176,7 @@ while [ $job_idx -lt $total ]; do
         echo "  [GPU $gpu] ${label}/${ds_name} (cfg=${cfg}, noffo=${noffo})"
         mkdir -p "$out_dir"
 
-        CUDA_VISIBLE_DEVICES=$gpu torchrun --standalone --nproc_per_node=1 \
+        CUDA_VISIBLE_DEVICES=$gpu $TORCHRUN --standalone --nproc_per_node=1 \
             --master_port $((29500 + gpu)) \
             scripts/inference_v2v.py \
             --config configs/inference_v2v.yaml \
@@ -206,17 +227,11 @@ METRIC_JOBS=()
 for combo_entry in "${COMBOS[@]}"; do
     IFS='|' read -r label step cfg noffo <<< "$combo_entry"
     for ds_entry in "${DATASETS[@]}"; do
-        IFS='|' read -r ds_name aligned_path orig_video_dir face_cache metrics_orig <<< "$ds_entry"
+        IFS='|' read -r ds_name aligned_path orig_video_dir face_cache <<< "$ds_entry"
 
         comp_dir="${PROJECT_DIR}/${OUTPUT_BASE}/${label}/${ds_name}_composited"
         log_dir="${PROJECT_DIR}/${OUTPUT_BASE}/metrics/${label}/${ds_name}"
-
-        # Determine real videos dir
-        if [ "$ds_name" = "hallo3_mixed" ]; then
-            real_dir="${PROJECT_DIR}/${MIXED_ORIG}"
-        else
-            real_dir="$metrics_orig"
-        fi
+        real_dir="${PROJECT_DIR}/${OUTPUT_BASE}/originals/${ds_name}"
 
         METRIC_JOBS+=("${label}|${ds_name}|${comp_dir}|${real_dir}|${log_dir}")
     done
@@ -359,4 +374,5 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file configs/accelerate_
     --compute_sync_metrics \
     --offload_frozen \
     --mask_all_frames \
-    --no_first_frame_overwrite
+    --no_first_frame_overwrite \
+    --wandb_api_key "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"
