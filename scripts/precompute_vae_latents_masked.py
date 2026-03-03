@@ -39,16 +39,15 @@ def load_frame0_from_video(video_path, target_size=(512, 512)):
     return Image.fromarray(frame)
 
 
-def apply_mask_to_frame(frame_pil, mask_binary):
-    """Apply pre-binarized mask to a single frame. Returns masked PIL Image."""
-    frame_np = np.array(frame_pil).astype(np.float32)
-    frame_np *= mask_binary[:, :, None]
-    return frame_np
+def frame_to_masked_tensor(frame_pil, mask_binary):
+    """Normalize to [-1,1] THEN mask. Masked region = 0.0 (mid-gray), not -1.0 (black).
 
-
-def frame_to_tensor(frame_np):
-    """Convert float32 [H, W, 3] (0-255 range) to [3, 1, H, W] normalized [-1, 1]."""
-    t = torch.from_numpy(frame_np * (2.0 / 255.0) - 1.0).permute(2, 0, 1)  # [3, H, W]
+    Must match StableAvatar's precompute convention (normalize first, mask second).
+    Returns [3, 1, H, W] float32 tensor.
+    """
+    frame_np = np.array(frame_pil).astype(np.float32) * (2.0 / 255.0) - 1.0  # [-1, 1]
+    frame_np *= mask_binary[:, :, None]  # masked region → 0.0
+    t = torch.from_numpy(frame_np).permute(2, 0, 1)  # [3, H, W]
     return t.unsqueeze(1)  # [3, 1, H, W]
 
 
@@ -160,8 +159,7 @@ def main():
                 errors += 1
                 continue
 
-            masked_frame_np = apply_mask_to_frame(frame0, mask_binary)
-            frame_tensor = frame_to_tensor(masked_frame_np)  # [3, 1, H, W]
+            frame_tensor = frame_to_masked_tensor(frame0, mask_binary)  # [3, 1, H, W]
 
             batch_tensors.append(frame_tensor)
             batch_meta.append((video_dir, input_latents, masked_latents))
