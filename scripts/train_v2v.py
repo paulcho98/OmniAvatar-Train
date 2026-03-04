@@ -1532,6 +1532,9 @@ def launch_training(dataset, model, args):
                 syncnet, syncnet_detector, use_wandb,
             )
 
+    # Ensure all ranks sync after optional step-0 validation (rank 0 only)
+    accelerator.wait_for_everyone()
+
     # --- Training loop ---
     consecutive_nones = 0
     # Number of batches to skip in the first resumed epoch
