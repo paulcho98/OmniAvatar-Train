@@ -386,7 +386,8 @@ class OmniAvatarV2VTrainingModule(nn.Module):
                  dtype=torch.bfloat16,
                  mask_all_frames=False,
                  no_first_frame_overwrite=False,
-                 use_ref_sequence=False):
+                 use_ref_sequence=False,
+                 mouth_weight=1.0):
         super().__init__()
         self.dtype = dtype
         self.use_gradient_checkpointing = use_gradient_checkpointing
@@ -396,6 +397,8 @@ class OmniAvatarV2VTrainingModule(nn.Module):
         self.mask_all_frames = mask_all_frames
         self.no_first_frame_overwrite = no_first_frame_overwrite
         self.use_ref_sequence = use_ref_sequence
+        self.mouth_weight = mouth_weight
+        self._last_unweighted_mse = None
 
         # --- 1. Load base models via ModelManager ---
         """
@@ -980,9 +983,29 @@ class OmniAvatarV2VTrainingModule(nn.Module):
         )
         self._log_vram("after-dit-forward")
 
-        # 8. Flow matching MSE loss with timestep weighting
-        # Apply timestep weight to MSE ONLY (not aux losses) — matching StableAvatar
-        loss = F.mse_loss(noise_pred.float(), training_target.float())
+        # 8. Flow matching MSE loss with spatial mask weighting + timestep weighting
+        if self.mouth_weight != 1.0 and self.latentsync_mask is not None:
+            # Per-element MSE (no reduction) for spatial weighting
+            loss_per_element = F.mse_loss(
+                noise_pred.float(), training_target.float(), reduction='none'
+            )
+            # loss_per_element: [1, 16, T_lat, H_lat, W_lat]
+
+            # Build weight map from latent-resolution mask
+            # latent_mask: [H_lat, W_lat], 1.0=keep (upper face), 0.0=mouth
+            latent_mask = self._get_latent_resolution_mask(noise_pred)
+            latent_mask = latent_mask.to(device=device)
+            mouth_indicator = 1.0 - latent_mask  # 1.0=mouth, 0.0=keep
+            # weight_map: mouth_weight in mouth, 1.0 outside
+            weight_map = mouth_indicator * (self.mouth_weight - 1.0) + 1.0
+            # Expand to [1, 1, 1, H_lat, W_lat] for broadcasting
+            weight_map = weight_map[None, None, None]
+
+            loss = (loss_per_element * weight_map).mean()
+            self._last_unweighted_mse = loss_per_element.mean().detach()
+        else:
+            loss = F.mse_loss(noise_pred.float(), training_target.float())
+            self._last_unweighted_mse = None
         loss = loss * self.scheduler.training_weight(timestep)
 
         # 9. Auxiliary losses on decoded x_0
@@ -1796,6 +1819,9 @@ def launch_training(dataset, model, args):
                             if uw._last_aux_losses:
                                 for k, v in uw._last_aux_losses.items():
                                     log_dict[f"aux/{k}"] = v.item() if hasattr(v, 'item') else v
+                            if uw._last_unweighted_mse is not None:
+                                log_dict["loss/mse_unweighted"] = uw._last_unweighted_mse.item()
+                                uw._last_unweighted_mse = None
                             wandb.log(log_dict, step=global_step)
                         except Exception as e:
                             print(f"[W&B] log error: {e}")
@@ -1994,6 +2020,9 @@ def train_parser():
     parser.add_argument("--aux_lpips_weight", type=float, default=0.1)
     parser.add_argument("--aux_trepa_weight", type=float, default=10.0)
     parser.add_argument("--aux_num_frames", type=int, default=21)
+    parser.add_argument("--mouth_weight", type=float, default=1.0,
+                        help="Weight multiplier for MSE loss in the mouth region. "
+                             "1.0 = uniform (disabled). 5.0 = StableAvatar default.")
     parser.add_argument("--sync_chunk_size", type=int, default=16)
     parser.add_argument("--sync_chunk_stride", type=int, default=8)
     parser.add_argument("--sync_num_supervised_frames", type=int, default=80)
@@ -2092,6 +2121,7 @@ if __name__ == "__main__":
         mask_all_frames=args.mask_all_frames,
         no_first_frame_overwrite=args.no_first_frame_overwrite,
         use_ref_sequence=args.use_ref_sequence,
+        mouth_weight=args.mouth_weight,
     )
 
     total = sum(p.numel() for p in model.parameters())
