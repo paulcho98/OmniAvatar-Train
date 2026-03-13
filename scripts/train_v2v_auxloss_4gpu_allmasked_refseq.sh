@@ -56,6 +56,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file configs/accelerate_
     --aux_lpips_weight 0.1 \
     --aux_trepa_weight 10.0 \
     --aux_num_frames 21 \
+    --mouth_weight 1.0 \
     --sync_chunk_size 16 \
     --sync_chunk_stride 8 \
     --sync_num_supervised_frames 80 \
