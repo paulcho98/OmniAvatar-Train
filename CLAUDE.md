@@ -1,3 +1,7 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 # OmniAvatar — Claude Code Context
 
 ## Project Goal
@@ -54,7 +58,7 @@ OmniAvatar/                          # Root
 │       └── models/, schedulers/, etc.
 ├── scripts/inference.py             # Inference entry point (chunked generation loop)
 ├── scripts/train.py                 # I2V training script (Accelerate + LoRA + wandb)
-├── scripts/train_v2v.py             # V2V lip sync training (49ch input, spatial mask)
+├── scripts/train_v2v.py             # V2V lip sync training (49ch or 65ch input, spatial mask)
 ├── scripts/precompute_audio_omniavatar.py  # Audio precomputation (10752-dim embeddings)
 ├── scripts/train_v2v_auxloss.sh     # Launch script for V2V training with aux losses (2 GPU)
 ├── scripts/train_v2v_auxloss_4gpus.sh  # 4-GPU variant (14B)
@@ -62,6 +66,16 @@ OmniAvatar/                          # Root
 ├── scripts/inference_v2v.py        # V2V inference (single-pass, no chunking)
 ├── scripts/inference_modified.py    # Modified inference (no zero audio prefix, matches training)
 ├── scripts/precompute_vae_latents_masked.py  # Precompute vae_latents_mask_all.pt for --mask_all_frames
+├── scripts/preprocess_v2v_integrated.py    # Integrated preprocessing: dirs + VAE + audio + ref latents
+├── scripts/slim_checkpoint.py       # Extract trainable params from accelerator ckpt (45GB → 3.6GB)
+├── scripts/composite_v2v.py         # Paste 512x512 face onto original-res video (no diffusion)
+├── scripts/eval_syncnet_batch.py    # Batch SyncNet eval across checkpoints and categories
+├── scripts/run_v2v_eval.sh          # Parallel V2V inference across steps/datasets on 4 GPUs
+├── scripts/resume_v2v_auxloss_4gpus.sh  # Resume V2V training from latest checkpoint
+├── scripts/resume_v2v_allmasked_4gpus.sh   # Resume V2V allmasked training
+├── scripts/train_v2v_auxloss_4gpu_allmasked_refseq.sh  # V2V allmasked + ref sequence (65ch)
+├── scripts/train_v2v_1.3B_all_masked.sh    # 1.3B V2V allmasked (takes ckpt as $1)
+├── scripts/run_preprocess_voxceleb2.sh     # Preprocess VoxCeleb2 data (4 GPU)
 ├── configs/                         # YAML configs (inference_1.3B.yaml, etc.)
 ├── examples/                        # Sample input files
 └── docs/                            # Reference documentation
@@ -71,10 +85,16 @@ OmniAvatar/                          # Root
 
 - **I2V base path**: `/home/work/.local/combined_data/high_visual_quality` (NOT `/home/work/combined_data/`)
 - **I2V metadata**: `test_metadata.csv` (in repo root, 3 test samples for smoke tests)
-- **V2V training**: `/home/work/stableavatar_data/v2v_training_data/` (29K videos)
+- **V2V training**: `/home/work/stableavatar_data/v2v_training_data/` (29K+ videos)
   - Path list: `video_square_path.txt` (one directory per line)
   - Each dir has: `sub_clip.mp4`, `audio.wav`, `prompt.txt`, `vae_latents.pt`, `audio_emb_omniavatar.pt`, `text_emb.pt`
   - Optional: `vae_latents_mask_all.pt` (frame 0 also masked, for `--mask_all_frames`)
+  - Optional: `ref_latents.pt` ([16, 21, 64, 64] bf16, for `--use_ref_sequence`)
+- **VoxCeleb2 data**: `~/data/VoxCeleb2_processed_all/high_visual_quality/` (~10K videos)
+  - Combined CSV: `metadata_combined_with_voxceleb2.csv` (36,497 entries = 29K original + 7.4K new)
+  - Combined path list: `video_square_path_combined.txt`
+- **Common prompt embedding**: `/home/work/.local/combined_data/text_emb/common_prompt.pt`
+  ([1, 512, 4096] bf16, T5 encoding of "a person is talking")
 - **V2V validation**: `/home/work/stableavatar_data/v2v_validation_data/{recon,mixed}/`
   - Recon: 10 samples (same identity video + audio), Mixed: 12 samples (cross-identity)
 - **LatentSync mask**: `/home/work/.local/Self-Forcing_LipSync_StableAvatar/diffsynth/utils/mask.png`
@@ -150,6 +170,143 @@ torchrun --standalone --nproc_per_node=8 scripts/inference.py \
 ```
 
 **Input file format** (`@@`-delimited): `prompt@@image_path@@audio_path` (one sample per line).
+
+### V2V Inference
+
+**latentsync_inference mode**: Pass `-hp "latentsync_inference=true,face_detection_cache_dir=/path/to/cache"`
+to do face detection + alignment + compositing all inline. Output is at near-original resolution
+(padded to multiples of 8: 1040x1040 for hdtf, 784x784 for hallo3, 1024x688 for mixed).
+Requires `insightface` and `onnxruntime-gpu` packages.
+
+```bash
+# V2V single-pass (no chunking), with optional LatentSync compositing
+CUDA_VISIBLE_DEVICES=0 python scripts/inference_v2v.py \
+  --config configs/inference_v2v.yaml \
+  --omniavatar_ckpt /path/to/checkpoint/trainable_params.pt \
+  --input_dir /path/to/validation_data/recon \
+  --output_dir demo_out/v2v_eval
+
+# Composite 512x512 faces back onto original-resolution video
+CUDA_VISIBLE_DEVICES=0 python scripts/composite_v2v.py \
+  --generated_dir demo_out/v2v_eval/step-5000/hdtf \
+  --original_videos_dir /path/to/original_videos \
+  --output_dir demo_out/v2v_eval/step-5000/hdtf_composited \
+  --face_cache_dir demo_out/v2v_eval/face_cache/hdtf
+```
+
+## Resuming Training
+
+```bash
+# Resume from latest checkpoint (reads wandb_id.txt for run continuity)
+bash scripts/resume_v2v_auxloss_4gpus.sh
+```
+
+Key flag: `--resume_from_checkpoint latest` — Accelerate finds the most recent `checkpoint-*`
+directory in `--output_path` and restores model, optimizer, scheduler, and dataloader state.
+Wandb run ID is persisted in `wandb_id.txt` inside each checkpoint directory.
+
+## Checkpoint Compression
+
+Full accelerator checkpoints are ~45 GB (model.safetensors + optimizer + scheduler). Only
+trainable params (LoRA + audio modules + patch_embedding) are needed for inference (~3.6 GB).
+
+```bash
+# Create lean checkpoint alongside original
+python scripts/slim_checkpoint.py /path/to/checkpoint-500
+
+# In-place replacement (deletes full model.safetensors)
+python scripts/slim_checkpoint.py /path/to/checkpoint-500 --in-place
+```
+
+Trainable param patterns: `lora_A`, `lora_B`, `audio_proj`, `audio_cond_projs`, `patch_embedding`.
+
+## Evaluation Pipeline
+
+### Validation Datasets & Ground Truth
+
+Ground truth videos for metrics are in `validation_*/shared_*data/` directories (original resolution),
+**NOT** `latentsync_eval_*/aligned_data/` (512x512 crops). Using aligned_data as originals gives
+nonsense metrics (e.g., CSIM ~0.12 instead of ~0.93 for reconstruction).
+
+| Dataset | Path | Resolution | Samples |
+|---|---|---|---|
+| hdtf | `/home/work/.local/StableAvatar/validation_hdtf/shared_hdtf_data/` | 1034x1034 | 33 |
+| hallo3 | `/home/work/.local/StableAvatar/validation_hallo3/shared_hallo3_data/` | 772x772 | 30 |
+| hallo3_mixed | `/home/work/.local/StableAvatar/validation_hallo3_mixed/shared_data/` | 1020x680 | 12 |
+
+Each sample dir has: `sub_clip.mp4`, `audio.wav`, `prompt.txt`, plus `face_cache/` at the dataset level.
+Face caches: `{aligned_faces, boxes, affine_matrices, resolution=512, num_frames}`.
+
+### Aligned Ground Truth (512x512)
+
+For evaluating raw model outputs (before compositing), use aligned GT:
+
+| Dataset | Path |
+|---|---|
+| hdtf | `/home/work/.local/StableAvatar/latentsync_eval_hdtf/aligned_data/` |
+| hallo3 | `/home/work/.local/StableAvatar/latentsync_eval_hallo3/aligned_data/` |
+| hallo3_mixed | `/home/work/.local/StableAvatar/latentsync_eval_hallo3_mixed/aligned_data/` |
+
+### LatentSync Qualitative Results
+
+Composited LatentSync outputs for comparison stitching:
+- hdtf: `/home/work/.local/qual_results/hdtf_short/LatentSync/final/{name}_synced.mp4`
+- hallo3: `/home/work/.local/qual_results/hallo3_short/LatentSync/final/{name}_synced.mp4`
+
+Note: naming is `{name}_synced.mp4` (no `_cfr25` suffix), while our outputs use `{name}_cfr25.mp4`.
+
+### Metrics Pipeline
+
+Uses `/home/work/.local/latentsync-metrics/` with conda env `latentsync-metrics`.
+`run_metrics.sh` has no skip/cache logic — always recomputes. Use `rm -rf` on the entire
+output dir to ensure fresh results. **Symlink gotcha**: `--fake_videos_top_level` uses
+`find -type f` which skips symlinks — use copied files, not symlinks, for fake video dirs.
+
+CSV column order: `step,dataset,FID,SSIM,FVD,CSIM,Sync-C,Sync-D,LMD`
+
+### Eval Scripts
+
+```bash
+# Maskall eval (multiple checkpoints, pipelined per-GPU, CSV + stitching)
+bash scripts/run_v2v_eval_maskall_multi.sh
+
+# Refseq eval (65ch, pipelined: inference → composited metrics → aligned metrics per GPU)
+bash scripts/run_v2v_eval_refseq.sh          # original refseq experiment
+bash scripts/run_v2v_eval_refseq_new.sh      # new data + loss weights
+
+# Ablation: 5 combos × 3 datasets
+bash scripts/run_v2v_eval_ablation.sh
+
+# Float compositing A/B test (single dataset, single GPU)
+bash scripts/run_v2v_eval_refseq_new_float.sh
+```
+
+### Video Stitching
+
+Side-by-side comparison videos using ffmpeg `hstack`. Always trim to shortest
+**frame count** (not duration) using `trim=end_frame=N` to avoid frozen frames at the end.
+
+```bash
+# Per-input trim by frame count (correct — no frozen frames):
+ffmpeg -i gt.mp4 -i gen.mp4 \
+  -filter_complex \
+  "[0:v]trim=end_frame=N,setpts=PTS-STARTPTS,scale=-2:H[a];
+   [1:v]trim=end_frame=N,setpts=PTS-STARTPTS,scale=-2:H[b];
+   [a][b]hstack=inputs=2" \
+  -c:v libx264 -preset fast -crf 18 -c:a aac -map 1:a? -shortest -y out.mp4
+
+# WRONG — trim=duration causes frozen frames when inputs differ by 1-2 frames:
+# [0:v]trim=duration=3.2  ← timestamps don't align exactly with frame boundaries
+```
+
+Existing stitched output directories:
+- `demo_out/v2v_stitched/` — 2-way GT|generated for ablation + prior eval
+- `demo_out/v2v_stitched_4way_refseq_new/` — 4-way GT|LatentSync|maskall-5500|refseq_new-3000
+  - `hdtf/` (33 videos), `hallo3/` (30 videos), `info.txt`
+- `demo_out/v2v_eval_maskall/stitched/` — 2-way per maskall checkpoint
+- `demo_out/v2v_eval_refseq_new/stitched_mask_ref_compare/` — 3-way GT|maskall|refseq
+
+The eval scripts use `/home/work/.local/latentsync-metrics/` for FVD, FID, CSIM, SSIM, LMD, SyncNet.
 
 ## How Inference Works
 
@@ -232,8 +389,11 @@ StableSyncNet, melspectrogram (audio.py), TREPALoss, lpips pip package
 
 ## V2V Training (train_v2v.py)
 
-- **49-channel input**: 16ch noise + 16ch ref_repeated + 1ch spatial_mask + 16ch masked_video.
+- **49-channel input** (default): 16ch noise + 16ch ref_repeated + 1ch spatial_mask + 16ch masked_video.
   `in_dim=49` in args singleton (vs 33 for I2V train.py).
+- **65-channel input** (`--use_ref_sequence`): Adds 16ch reference sequence latents from a
+  non-overlapping video segment. `in_dim=65`. Patch embedding expanded from 49→65ch with
+  zero-init for new channels. Precomputed as `ref_latents.pt` ([16, 21, 64, 64] bf16).
 - **Precomputed data**: `vae_latents.pt` from StableAvatar (compatible Wan VAE),
   `audio_emb_omniavatar.pt` from our precompute script (10752-dim, NOT StableAvatar's 768-dim).
 - **Precomputed text**: `text_emb.pt` from StableAvatar preprocessing (same T5 model, [1, 512, 4096]).
@@ -306,10 +466,33 @@ StableSyncNet, melspectrogram (audio.py), TREPALoss, lpips pip package
   Use `--gradient_accumulation_steps` for larger effective batch sizes.
 - **1.3B uses same VAE as 14B** — `Wan2.1_VAE.pth` is identical (507 MB). Audio modules
   (`audio_hidden_size=32`) are also model-size-independent. Only DiT dims change.
+- **`from ..utils.args_config import args` creates a local binding** — reassigning
+  `args_module.args = new_namespace` does NOT update the local binding in `wan_video_dit.py`.
+  To change `in_dim` at runtime, mutate the existing object: `args_module.args.model_config["in_dim"] = 65`.
+  This is how `--use_ref_sequence` works in both `train_v2v.py` and `inference_v2v.py`.
 - **xfuser conflicts with Flash Attention 3** — xfuser registers simplified flash_attn_3
   operators that break real FA3 ("expected 3 arguments but received 32"). Import
   `flash_attn_interface` BEFORE xfuser. Training (sp_size=1) uses FA3; multi-GPU
   inference (sp_size>1) falls back to FA2 automatically.
+
+## Data Preprocessing Pipeline
+
+**Integrated script** (`scripts/preprocess_v2v_integrated.py`): Creates full training data
+structure from raw videos + CSV. Phase 1 (CPU): dirs, symlinks, audio extraction, text_emb.
+Phase 2 (GPU): VAE encode (GT + masked + ref) + Wav2Vec2 audio. Skips existing complete dirs.
+
+```bash
+# Preprocess new VoxCeleb2 videos (4 GPUs, skips existing 29K)
+bash scripts/run_preprocess_voxceleb2.sh
+```
+
+**Per-video output**: `sub_clip.mp4`, `audio.wav`, `prompt.txt`, `text_emb.pt`,
+`vae_latents_mask_all.pt`, `audio_emb_omniavatar.pt`, `ref_latents.pt`
+
+**VAE difference**: OmniAvatar's `WanVideoVAE.encode()` returns deterministic `mu` only.
+StableAvatar's `AutoencoderKLWan.encode().sample()` adds stochastic noise. Our integrated
+script uses OmniAvatar's VAE consistently — outputs differ numerically from StableAvatar's
+`vae_latents.pt` but are internally self-consistent.
 
 ## Model Configurations
 

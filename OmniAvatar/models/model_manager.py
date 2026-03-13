@@ -334,16 +334,66 @@ class ModelManager:
 
     def load_model(self, file_path, model_names=None, device=None, torch_dtype=None):
         print(f"Loading models from: {file_path}")
-        if device is None: device = self.device
+        if device is None: device = self.device             ## cpu
         if torch_dtype is None: torch_dtype = self.torch_dtype
-        if isinstance(file_path, list):
+        if isinstance(file_path, list):         ##  <--------   file_path = ["pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00001-of-00006.safetensors", ..., "...-00006-of-00006.safetensors"
             state_dict = {}
+            """
+            state_dict:
+            {
+                "patch_embedding.weight": tensor(...),       # from shard 1
+                "patch_embedding.bias": tensor(...),         # from shard 1
+                "blocks.0.self_attn.q.weight": tensor(...),  # from shard 1
+                "blocks.0.self_attn.k.weight": tensor(...),  # from shard 1
+                ...
+                "blocks.20.ffn.2.weight": tensor(...),       # from shard 3 or 4
+                ...
+                "blocks.39.ffn.2.weight": tensor(...),       # from shard 6
+                "head.head.weight": tensor(...),             # from shard 6
+            }
+            """
             for path in file_path:
                 state_dict.update(load_state_dict(path))
         elif os.path.isfile(file_path):
+            """
+            For T5 (models_t5_umt5-xxl-enc-bf16.pth):
+                {
+                    "encoder.embed_tokens.weight": tensor(...),
+                    "encoder.block.0.layer.0.SelfAttention.q.weight": tensor(...),
+                    ...
+                    "encoder.block.23.layer.1.DenseReluDense.wi_1.weight": tensor(...),
+                    "encoder.final_layer_norm.weight": tensor(...),
+                }
+
+                For VAE (Wan2.1_VAE.pth):
+                {
+                    "encoder.conv_in.conv.weight": tensor(...),
+                    "encoder.mid.attn_1.norm.weight": tensor(...),
+                    ...
+                    "decoder.conv_out.conv.weight": tensor(...),
+                }
+            """
             state_dict = load_state_dict(file_path)
         else:
             state_dict = None
+
+        """
+        It calls into ModelDetectorFromSingleFile.load() (line 138), which looks up the matched model class from the hash table, then calls load_model_from_single_file() (line 8). That function
+        does:
+
+        1. Gets the model class — e.g. WanVideoModel for DiT, WanVideoVAE for VAE
+        2. state_dict_converter — converts key names from the checkpoint format to the model's internal format (e.g. HuggingFace naming → DiffSynth naming)
+        3. model_class(**extra_kwargs) — constructs the model with empty weights. For the DiT, extra_kwargs includes in_dim from args.model_config (which is 49 for V2V)
+        4. Since infer=False (lines 27-33):
+            - Moves to CPU with to_empty(device="cpu")
+            - Xavier-inits all weight matrices (gain=0.05), zeros all biases
+        5. smart_load_weights(model, model_state_dict) — overlays the Wan 2.1 weights onto the xavier-initialized model. For mismatched shapes (like 16ch checkpoint into 49ch patch_embedding), it
+        copies what fits and leaves the rest xavier-initialized
+        6. Casts to target dtype/device — model.to(dtype=torch_dtype, device="cpu")
+
+        So the model starts fully xavier-initialized, then gets the base Wan 2.1 weights overlaid on top. New parameters (extra patch_embedding channels, audio module placeholders) keep their
+        xavier values.
+        """
         for model_detector in self.model_detector:
             if model_detector.match(file_path, state_dict):
                 model_names, models = model_detector.load(

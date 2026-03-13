@@ -49,6 +49,12 @@ from PIL import Image
 from OmniAvatar.utils.args_config import parse_args
 args = parse_args()
 
+# Override in_dim when use_ref_sequence is enabled (49ch → 65ch)
+if getattr(args, "use_ref_sequence", False):
+    if hasattr(args, "model_config") and isinstance(args.model_config, dict):
+        args.model_config["in_dim"] = 65
+        print(f"[Config] Reference sequence enabled: in_dim=65")
+
 from OmniAvatar.utils.io_utils import load_state_dict
 from peft import LoraConfig, inject_adapter_in_model
 from OmniAvatar.models.model_manager import ModelManager
@@ -255,6 +261,80 @@ def composite_with_latentsync(generated_frames_np, latentsync_metadata, image_pr
     return np.stack(composite_frames)
 
 
+def composite_with_latentsync_float(generated_float, latentsync_metadata, image_processor,
+                                     use_mouth_only_compositing=False):
+    """Composite generated faces back onto original video, staying in float space.
+
+    Unlike composite_with_latentsync (which takes uint8 numpy), this function accepts the
+    model output as a float tensor and avoids uint8 quantization before compositing.
+    This matches LatentSync-train's data flow for maximum precision.
+
+    Args:
+        generated_float: [T, C, H, W] float tensor in [0, 1]
+    """
+    import torchvision.transforms.functional as TF_v
+
+    original_frames = latentsync_metadata["original_frames"]
+    if original_frames is None:
+        video_path = latentsync_metadata["video_path"]
+        num_frames = latentsync_metadata.get("num_frames", 81)
+        cap = cv2.VideoCapture(video_path)
+        frames = []
+        for _ in range(num_frames):
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames.append(frame)
+        cap.release()
+        while len(frames) < num_frames:
+            frames.append(frames[-1].copy())
+        original_frames = np.stack(frames, axis=0)
+
+    boxes = latentsync_metadata["boxes"]
+    affine_matrices = latentsync_metadata["affine_matrices"]
+    detection_failures = latentsync_metadata.get("detection_failures", [])
+    aligned_faces = latentsync_metadata.get("aligned_faces", None)
+
+    composite_frames = []
+
+    for i in range(generated_float.shape[0]):
+        if i in detection_failures or boxes[i] is None:
+            composite_frames.append(original_frames[i])
+            continue
+
+        face = generated_float[i]  # [C, H, W] float [0,1]
+
+        # Mouth-only compositing in float space (no uint8 quantization)
+        if use_mouth_only_compositing and aligned_faces is not None:
+            mouth_mask = image_processor.mask_image.float()  # [C, H, W] float32
+            original_aligned_float = aligned_faces[i].float() / 255.0  # uint8 → [0,1]
+            face = face * (1 - mouth_mask) + original_aligned_float * mouth_mask
+
+        # Resize in float space
+        x1, y1, x2, y2 = boxes[i]
+        height = int(y2 - y1)
+        width = int(x2 - x1)
+        face_resized = TF_v.resize(
+            face, size=[height, width],
+            interpolation=TF_v.InterpolationMode.BICUBIC, antialias=True,
+        )
+
+        # Convert [0,1] → [-1,1] for restore_img (NO uint8 round-trip)
+        face_resized = face_resized * 2.0 - 1.0
+
+        try:
+            restored_frame = image_processor.restorer.restore_img(
+                original_frames[i], face_resized, affine_matrices[i]
+            )
+            composite_frames.append(restored_frame)
+        except Exception as e:
+            print(f"[LatentSync] Restoration failed for frame {i}: {e}")
+            composite_frames.append(original_frames[i])
+
+    return np.stack(composite_frames)
+
+
 # ---------------------------------------------------------------------------
 # Video loading utilities
 # ---------------------------------------------------------------------------
@@ -326,16 +406,21 @@ def load_latentsync_mask(mask_path, latent_h, latent_w):
     return (mask_resized > 0.5).float().squeeze(0).squeeze(0)  # [H_lat, W_lat]
 
 
-def prepare_v2v_y(ref_latent, masked_video_latents, latent_mask, mask_all_frames=False):
-    """Build 33-channel y tensor for V2V (from train_v2v.py:prepare_v2v_input).
+def prepare_v2v_y(ref_latent, masked_video_latents, latent_mask,
+                  mask_all_frames=False, ref_sequence_latents=None):
+    """Build y tensor for V2V (from train_v2v.py:prepare_v2v_input).
+
+    Without ref_sequence: 33ch = ref_repeated(16) + mask(1) + masked_video(16)
+    With ref_sequence:    49ch = ref_repeated(16) + mask(1) + masked_video(16) + ref_seq(16)
 
     Args:
         ref_latent: [1, 16, 1, H, W]
         masked_video_latents: [1, 16, T, H, W]
         latent_mask: [H, W] (1=keep, 0=mask, LatentSync convention)
         mask_all_frames: if True, apply spatial mask to ALL frames including frame 0
+        ref_sequence_latents: [1, 16, T, H, W] or None
     Returns:
-        y: [1, 33, T, H, W]
+        y: [1, 33 or 49, T, H, W]
     """
     T_lat = masked_video_latents.shape[2]
     H_lat, W_lat = masked_video_latents.shape[3], masked_video_latents.shape[4]
@@ -353,7 +438,52 @@ def prepare_v2v_y(ref_latent, masked_video_latents, latent_mask, mask_all_frames
         mask_ch[:, :, 0] = 0  # Frame 0: keep all (reference)
         mask_ch[:, :, 1:] = inverted[None, None, None]
 
-    return torch.cat([ref_repeated, mask_ch, masked_video_latents], dim=1)
+    parts = [ref_repeated, mask_ch, masked_video_latents]
+    if ref_sequence_latents is not None:
+        parts.append(ref_sequence_latents)
+
+    return torch.cat(parts, dim=1)
+
+
+def load_ref_sequence_frames(video_path, num_frames, target_size):
+    """Load non-overlapping reference segment from video.
+
+    Selection logic (matches StableAvatar precompute_ref_latents.py):
+    - Videos with >=2*num_frames: ref starts at frame num_frames (non-overlapping)
+    - Shorter videos: uses last available frames to minimize overlap
+
+    Returns:
+        frames_np: [N, H, W, 3] uint8 array, or None if video too short
+    """
+    cap = cv2.VideoCapture(video_path)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total_frames < 5:
+        cap.release()
+        return None
+
+    if total_frames >= 2 * num_frames:
+        ref_start = num_frames
+    else:
+        ref_start = max(0, total_frames - num_frames)
+
+    ref_num = min(num_frames, total_frames - ref_start)
+    while ref_num > 1 and ref_num % 4 != 1:
+        ref_num -= 1
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, ref_start)
+    frames = []
+    for _ in range(ref_num):
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame = cv2.resize(frame, target_size, interpolation=cv2.INTER_LANCZOS4)
+        frames.append(frame)
+    cap.release()
+
+    if len(frames) < 5:
+        return None
+    return np.stack(frames, axis=0)
 
 
 # ---------------------------------------------------------------------------
@@ -361,10 +491,16 @@ def prepare_v2v_y(ref_latent, masked_video_latents, latent_mask, mask_all_frames
 # ---------------------------------------------------------------------------
 
 def mux_video_with_audio(video_path_silent, audio_path, output_path, duration_s=None):
-    """Mux a silent video with an audio file using ffmpeg."""
+    """Mux a silent video with an audio file using ffmpeg.
+
+    Re-encodes video at CRF 18 to match LatentSync-train's pipeline.
+    """
     cmd = [
-        "ffmpeg", "-y", "-i", video_path_silent, "-i", audio_path,
-        "-c:v", "copy", "-c:a", "aac", "-shortest",
+        "ffmpeg", "-y", "-loglevel", "error", "-nostdin",
+        "-i", video_path_silent, "-i", audio_path,
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-c:v", "libx264", "-crf", "18",
+        "-c:a", "aac", "-q:v", "0", "-q:a", "0",
     ]
     if duration_s is not None:
         cmd.extend(["-t", f"{duration_s:.4f}"])
@@ -558,6 +694,7 @@ class WanV2VInferencePipeline(nn.Module):
         guidance_scale = guidance_scale if guidance_scale is not None else self.args.guidance_scale
         mask_all_frames = getattr(self.args, "mask_all_frames", False)
         no_first_frame_overwrite = getattr(self.args, "no_first_frame_overwrite", False)
+        use_ref_sequence = getattr(self.args, "use_ref_sequence", False)
 
         H, W = 512, 512
         T_lat = (num_frames + 3) // 4  # latent temporal frames (81 → 21)
@@ -605,10 +742,32 @@ class WanV2VInferencePipeline(nn.Module):
             masked_video_tensor.to(dtype=self.dtype, device=self.device), tiled=False
         ).to(self.device)  # [1, 16, T_lat, latent_h, latent_w]
 
-        # --- 4. Build V2V y tensor (33ch) ---
+        # --- 4. Build V2V y tensor (33ch or 49ch with ref_sequence) ---
         ref_latent = source_latents[:, :, :1]  # [1, 16, 1, H, W]
         latent_mask = load_latentsync_mask(mask_path, latent_h, latent_w).to(self.device)
-        y = prepare_v2v_y(ref_latent, masked_video_latents, latent_mask, mask_all_frames)
+
+        # Reference sequence latents (if enabled)
+        ref_sequence_latents = None
+        if use_ref_sequence:
+            # Try precomputed ref_latents.pt in same dir as video
+            video_dir = os.path.dirname(video_path)
+            ref_path = os.path.join(video_dir, "ref_latents.pt")
+            if os.path.exists(ref_path):
+                ref_data = torch.load(ref_path, map_location="cpu", weights_only=False)
+                ref_sequence_latents = ref_data["ref_sequence_latents"].unsqueeze(0).to(
+                    dtype=self.dtype, device=self.device
+                )
+            else:
+                # Live: load non-overlapping segment from video, VAE-encode
+                ref_frames = load_ref_sequence_frames(video_path, num_frames, (W, H))
+                if ref_frames is not None:
+                    ref_tensor = frames_to_video_tensor(ref_frames)
+                    ref_sequence_latents = self.pipe.encode_video(
+                        ref_tensor.to(dtype=self.dtype, device=self.device), tiled=False
+                    ).to(self.device)
+
+        y = prepare_v2v_y(ref_latent, masked_video_latents, latent_mask,
+                          mask_all_frames, ref_sequence_latents)
 
         # --- 5. Encode text (load to GPU, then offload after) ---
         self.pipe.load_models_to_device(['text_encoder'])
@@ -757,7 +916,7 @@ def main():
     date_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     num_frames = getattr(args, "num_frames", 81)
     latentsync_inference = getattr(args, "latentsync_inference", False)
-    save_aligned = getattr(args, "save_aligned_video", False)
+    # Aligned (512x512) outputs are always saved in latentsync mode
     use_mouth_only = getattr(args, "use_mouth_only_compositing", False)
     face_cache_dir = getattr(args, "face_detection_cache_dir", None)
 
@@ -823,34 +982,39 @@ def main():
                 sample_name = file_name
             video_stem = sample_name
 
-            # Convert generated frames [T, C, H, W] float [0, 1] → [T, H, W, C] uint8
-            generated_np = (frames.permute(0, 2, 3, 1).clamp(0, 1) * 255).byte().cpu().numpy()
-
             # The video path used for SyncNet evaluation (must have audio)
             eval_video_path = None
 
             if latentsync_inference and latentsync_metadata is not None:
-                # Save aligned video (optional)
-                if save_aligned:
-                    aligned_path = os.path.join(output_dir, f"{video_stem}_aligned.mp4")
-                    save_frames_as_video(generated_np, aligned_path, fps=25)
+                duration_s = num_frames / 25.0
 
-                # Composite back onto original resolution
-                composited_np = composite_with_latentsync(
-                    generated_np, latentsync_metadata, inferpipe.image_processor,
+                # Keep float tensor for compositing (avoid uint8 quantization)
+                generated_float = frames.clamp(0, 1).cpu()  # [T, C, H, W] float [0,1]
+
+                # Save aligned (512x512) video + audio (needs uint8 for video file)
+                generated_np = (generated_float.permute(0, 2, 3, 1) * 255).byte().numpy()
+                aligned_path = os.path.join(output_dir, f"{video_stem}_aligned.mp4")
+                save_frames_as_video(generated_np, aligned_path, fps=25)
+                aligned_with_audio = os.path.join(output_dir, f"{video_stem}_aligned_audio.mp4")
+                mux_video_with_audio(aligned_path, audio_path, aligned_with_audio, duration_s)
+
+                # Composite using float tensor (matches LatentSync-train precision)
+                composited_np = composite_with_latentsync_float(
+                    generated_float, latentsync_metadata, inferpipe.image_processor,
                     use_mouth_only_compositing=use_mouth_only,
                 )
                 final_path = os.path.join(output_dir, f"{video_stem}_composited.mp4")
                 save_frames_as_video(composited_np, final_path, fps=25)
 
-                # Mux with audio
+                # Mux composited with audio
                 final_with_audio = os.path.join(output_dir, f"{video_stem}_composited_audio.mp4")
-                duration_s = num_frames / 25.0
                 mux_video_with_audio(final_path, audio_path, final_with_audio, duration_s)
                 eval_video_path = final_with_audio
-                print(f"[Output] {final_with_audio}")
+                print(f"[Output] {final_with_audio} (composited)")
+                print(f"[Output] {aligned_with_audio} (aligned 512x512)")
             else:
                 # Standard mode: save video + mux with audio
+                generated_np = (frames.permute(0, 2, 3, 1).clamp(0, 1) * 255).byte().cpu().numpy()
                 silent_path = os.path.join(output_dir, f"{video_stem}.mp4")
                 save_frames_as_video(generated_np, silent_path, fps=25)
                 with_audio_path = os.path.join(output_dir, f"{video_stem}_audio.mp4")
@@ -890,9 +1054,17 @@ def main():
 
 
 def save_frames_as_video(frames_np, output_path, fps=25):
-    """Save [N, H, W, 3] uint8 numpy array as mp4 video."""
+    """Save [N, H, W, 3] uint8 numpy array as mp4 video.
+
+    Uses CRF 13 + macro_block_size=None to match LatentSync-train's write_video().
+    """
     import imageio
-    writer = imageio.get_writer(output_path, fps=fps, codec='libx264', quality=8)
+    writer = imageio.get_writer(
+        output_path, fps=fps, codec='libx264',
+        macro_block_size=None,
+        ffmpeg_params=["-crf", "13"],
+        ffmpeg_log_level="error",
+    )
     for frame in frames_np:
         writer.append_data(frame)
     writer.close()

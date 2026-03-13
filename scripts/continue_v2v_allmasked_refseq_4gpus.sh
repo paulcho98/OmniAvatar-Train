@@ -1,0 +1,79 @@
+#!/bin/bash
+# Continue OmniAvatar V2V mask-all-frames + ref_sequence training from a checkpoint
+# with a FRESH wandb run. Use this when starting a new training phase from an existing
+# checkpoint (e.g., changing hyperparams, data, or output dir).
+#
+# Usage: bash scripts/continue_v2v_allmasked_refseq_4gpus.sh /path/to/step-XXXX.pt
+#
+# For resuming the SAME run (same wandb run, same output dir), use:
+#   bash scripts/resume_v2v_allmasked_refseq_4gpus.sh
+
+if [ -z "$1" ]; then
+    echo "Usage: $0 <checkpoint_path>"
+    echo "Example: $0 /home/work/output_omniavatar_v2v_maskall_refseq/step-2000.pt"
+    exit 1
+fi
+
+CKPT_PATH="$1"
+
+# Extract step number from filename (e.g., step-5500.pt → 5500)
+STEP=$(basename "$CKPT_PATH" | grep -oP '\d+')
+if [ -z "$STEP" ]; then
+    STEP="unknown"
+fi
+
+export TOKENIZERS_PARALLELISM=false
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file configs/accelerate_4gpus.yaml \
+    scripts/train_v2v.py \
+    --dit_paths "pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00001-of-00006.safetensors,pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00002-of-00006.safetensors,pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00003-of-00006.safetensors,pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00004-of-00006.safetensors,pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00005-of-00006.safetensors,pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00006-of-00006.safetensors" \
+    --text_encoder_path pretrained_models/Wan2.1-T2V-14B/models_t5_umt5-xxl-enc-bf16.pth \
+    --vae_path pretrained_models/Wan2.1-T2V-14B/Wan2.1_VAE.pth \
+    --wav2vec_path pretrained_models/wav2vec2-base-960h \
+    --omniavatar_ckpt "$CKPT_PATH" \
+    --data_list_path /home/work/stableavatar_data/v2v_training_data/video_square_path_combined.txt \
+    --latentsync_mask_path /home/work/.local/Self-Forcing_LipSync_StableAvatar/diffsynth/utils/mask.png \
+    --use_precomputed_vae \
+    --use_precomputed_audio \
+    --use_precomputed_text_emb \
+    --num_frames 81 --height 512 --width 512 \
+    --num_epochs 1000 \
+    --learning_rate 5e-5 \
+    --gradient_accumulation_steps 2 \
+    --max_grad_norm 1 \
+    --weight_decay 0.01 \
+    --seed 42 \
+    --use_gradient_checkpointing \
+    --text_drop_prob 0.1 \
+    --audio_drop_prob 0.1 \
+    --output_path /home/work/output_omniavatar_v2v_maskall_refseq_new_data_loss_weights \
+    --save_steps 500 \
+    --use_sync_loss \
+    --use_lpips_loss \
+    --use_trepa_loss \
+    --use_vae_gradient_checkpointing \
+    --aux_recon_weight 1.0 \
+    --aux_sync_weight 0.1 \
+    --aux_lpips_weight 0.15 \
+    --aux_trepa_weight 10.0 \
+    --aux_num_frames 21 \
+    --sync_chunk_size 16 \
+    --sync_chunk_stride 8 \
+    --sync_num_supervised_frames 80 \
+    --val_data_recon /home/work/stableavatar_data/v2v_validation_data/recon \
+    --val_data_mixed /home/work/stableavatar_data/v2v_validation_data/mixed \
+    --val_max_samples 4 \
+    --val_num_inference_steps 25 \
+    --validation_steps 500 \
+    --validate_at_start \
+    --use_wandb \
+    --wandb_entity "paulhcho" \
+    --wandb_project "OmniAvatar-V2V" \
+    --wandb_run_name "v2v_14B_maskall_refseq_from${STEP}_from5500_new_data_loss_weights" \
+    --wandb_log_every 1 \
+    --compute_sync_metrics \
+    --offload_frozen \
+    --mask_all_frames \
+    --no_first_frame_overwrite \
+    --use_ref_sequence \
+    --wandb_api_key "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"

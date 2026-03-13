@@ -58,12 +58,17 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 import OmniAvatar.utils.args_config as args_module
 
 
-def setup_omniavatar_args():
-    """Configure the global args singleton for V2V (49-channel input)."""
+def setup_omniavatar_args(use_ref_sequence=False):
+    """Configure the global args singleton for V2V.
+
+    in_dim=49 (default): 16ch noise + 16ch ref + 1ch mask + 16ch masked_video
+    in_dim=65 (ref_sequence): + 16ch reference sequence latents
+    """
+    in_dim = 65 if use_ref_sequence else 49
     args_obj = argparse.Namespace(
         use_audio=True,
         sp_size=1,           # No sequence parallel — Accelerate handles DDP
-        model_config={"in_dim": 49, "audio_hidden_size": 32},
+        model_config={"in_dim": in_dim, "audio_hidden_size": 32},
         i2v=True,
         random_prefix_frames=True,
     )
@@ -105,7 +110,7 @@ class OmniAvatarV2VDataset(torch.utils.data.Dataset):
                  latentsync_mask_path=None,
                  use_precomputed_vae=False, use_precomputed_audio=False,
                  use_precomputed_text_emb=False,
-                 mask_all_frames=False):
+                 mask_all_frames=False, use_ref_sequence=False):
         self.num_frames = num_frames
         self.height = height
         self.width = width
@@ -116,8 +121,16 @@ class OmniAvatarV2VDataset(torch.utils.data.Dataset):
         self.use_precomputed_audio = use_precomputed_audio
         self.use_precomputed_text_emb = use_precomputed_text_emb
         self.mask_all_frames = mask_all_frames
+        self.use_ref_sequence = use_ref_sequence
 
         # Read video directories
+        """
+        [
+          /home/work/stableavatar_data/v2v_training_data/video_001
+          /home/work/stableavatar_data/v2v_training_data/video_002
+          ...
+        ]
+        """
         with open(data_list_path) as f:
             self.video_dirs = [line.strip() for line in f if line.strip()]
 
@@ -129,7 +142,7 @@ class OmniAvatarV2VDataset(torch.utils.data.Dataset):
             if mask_arr.ndim == 3:
                 mask_arr = mask_arr[:, :, 0]  # Take first channel
             # Normalize to [0, 1]: 255→1 (keep), 0→0 (mask)
-            self.latentsync_mask = torch.from_numpy(mask_arr.astype(np.float32) / 255.0)
+            self.latentsync_mask = torch.from_numpy(mask_arr.astype(np.float32) / 255.0)        ## [256, 256]
 
     def _getitem_precomputed(self, video_dir):
         """Load precomputed VAE latents and audio embeddings."""
@@ -152,6 +165,13 @@ class OmniAvatarV2VDataset(torch.utils.data.Dataset):
             audio_path = os.path.join(video_dir, "audio_emb_omniavatar.pt")
             audio_data = torch.load(audio_path, map_location="cpu")
             result["precomputed_audio_emb"] = audio_data["audio_emb"]  # [total_frames, 10752]
+
+        # Reference sequence latents
+        if self.use_ref_sequence:
+            ref_path = os.path.join(video_dir, "ref_latents.pt")
+            if os.path.exists(ref_path):
+                ref_data = torch.load(ref_path, map_location="cpu", weights_only=False)
+                result["precomputed_ref_sequence"] = ref_data["ref_sequence_latents"]  # [16, 21, 64, 64]
 
         # Precomputed text embeddings
         if self.use_precomputed_text_emb:
@@ -263,7 +283,7 @@ class OmniAvatarV2VDataset(torch.utils.data.Dataset):
             with open(prompt_path) as f:
                 prompt = f.read().strip()
 
-        return {
+        result = {
             "video": frames,
             "masked_video": masked_frames,
             "audio": audio_np,
@@ -272,6 +292,37 @@ class OmniAvatarV2VDataset(torch.utils.data.Dataset):
             "video_dir": video_dir,
             "audio_path": audio_path,
         }
+
+        # Load reference sequence (non-overlapping segment from same video)
+        if self.use_ref_sequence:
+            result.update(self._load_ref_sequence(video_path))
+
+        return result
+
+    def _load_ref_sequence(self, video_path):
+        """Load a non-overlapping reference segment from the video.
+
+        Selection logic (matches StableAvatar precompute_ref_latents.py):
+        - Videos with >=162 frames: ref starts at frame 81 (after training segment)
+        - Shorter videos: uses last available frames to minimize overlap
+        """
+        reader = imageio.get_reader(video_path)
+        total_frames = reader.count_frames()
+        if total_frames >= 2 * self.num_frames:
+            ref_start = self.num_frames  # Non-overlapping
+        else:
+            ref_start = max(0, total_frames - self.num_frames)
+        ref_num = min(self.num_frames, total_frames - ref_start)
+        # Ensure ref_num satisfies VAE temporal constraint (must be 4k+1)
+        while ref_num > 1 and ref_num % 4 != 1:
+            ref_num -= 1
+        ref_frames = []
+        for i in range(ref_start, ref_start + ref_num):
+            frame = Image.fromarray(reader.get_data(i))
+            frame = self._crop_and_resize(frame, self.height, self.width)
+            ref_frames.append(frame)
+        reader.close()
+        return {"ref_sequence_video": ref_frames}
 
     def __getitem__(self, data_id):
         video_dir = self.video_dirs[data_id % len(self.video_dirs)]
@@ -293,6 +344,12 @@ class OmniAvatarV2VDataset(torch.utils.data.Dataset):
                     audio_path = os.path.join(video_dir, "audio.wav")
                     audio_np, _ = librosa.load(audio_path, sr=self.sample_rate)
                     result["audio"] = audio_np
+                # If ref_sequence needed but not precomputed, load from video
+                if self.use_ref_sequence and "precomputed_ref_sequence" not in result:
+                    video_path = os.path.join(video_dir, "sub_clip.mp4")
+                    if not os.path.exists(video_path):
+                        video_path = os.path.join(video_dir, "video.mp4")
+                    result.update(self._load_ref_sequence(video_path))
                 return result
             else:
                 return self._getitem_live(video_dir)
@@ -311,7 +368,8 @@ class OmniAvatarV2VDataset(torch.utils.data.Dataset):
 class OmniAvatarV2VTrainingModule(nn.Module):
     """Training module for OmniAvatar V2V lip sync.
 
-    49-channel input: 16ch noise + 16ch ref_repeated + 1ch spatial_mask + 16ch masked_video.
+    49ch input: 16ch noise + 16ch ref_repeated + 1ch spatial_mask + 16ch masked_video
+    65ch input (--use_ref_sequence): + 16ch reference sequence latents
 
     Frozen: T5 text encoder, VAE, Wav2Vec2
     Trainable (LoRA): DiT attention (q,k,v,o) and FFN (ffn.0, ffn.2)
@@ -327,7 +385,8 @@ class OmniAvatarV2VTrainingModule(nn.Module):
                  num_training_frames=81,
                  dtype=torch.bfloat16,
                  mask_all_frames=False,
-                 no_first_frame_overwrite=False):
+                 no_first_frame_overwrite=False,
+                 use_ref_sequence=False):
         super().__init__()
         self.dtype = dtype
         self.use_gradient_checkpointing = use_gradient_checkpointing
@@ -336,15 +395,31 @@ class OmniAvatarV2VTrainingModule(nn.Module):
         self.num_training_frames = num_training_frames
         self.mask_all_frames = mask_all_frames
         self.no_first_frame_overwrite = no_first_frame_overwrite
+        self.use_ref_sequence = use_ref_sequence
 
         # --- 1. Load base models via ModelManager ---
-        model_manager = ModelManager(device="cpu", infer=False)
+        """
+        model_manager.model = [
+            WanVideoModel(...),    # DiT — 14B transformer, 40 layers, in_dim=49
+            WanVideoTextEncoder(...),  # T5 — umt5-xxl encoder
+            WanVideoVAE(...),      # VAE — video autoencoder
+        ]
+
+        With corresponding self.model_name:
+        ["dit", "text_encoder", "vae"]
+
+        All on CPU, with base Wan 2.1 weights loaded. No LoRA, no audio modules, no OmniAvatar-specific weights yet.
+        """
+        model_manager = ModelManager(device="cpu", infer=False) 
         model_manager.load_models(
             [dit_paths.split(","), text_encoder_path, vae_path],
             torch_dtype=dtype, device="cpu",
         )
 
         # --- 2. Create pipeline ---
+        """
+        set self.pipe.dit, self.pipe.text_encoder, self.pipe.vae from the loaded models. The pipeline will handle moving to GPU later.
+        """
         self.pipe = WanVideoPipeline.from_model_manager(
             model_manager, torch_dtype=dtype, device="cpu",
         )
@@ -356,6 +431,14 @@ class OmniAvatarV2VTrainingModule(nn.Module):
         self.pipe.requires_grad_(False)
 
         # --- 5. Add LoRA to DiT ---
+        """
+        LoraConfig(
+            r=128,
+            lora_alpha=64,
+            init_lora_weights=True,
+            target_modules=["q", "k", "v", "o", "ffn.0", "ffn.2"],
+        )
+        """
         lora_config = LoraConfig(
             r=lora_rank, lora_alpha=lora_alpha,
             init_lora_weights=True,
@@ -369,6 +452,36 @@ class OmniAvatarV2VTrainingModule(nn.Module):
         # --- 6. Load OmniAvatar checkpoint (33ch → 49ch expansion) ---
         if omniavatar_ckpt:
             print(f"[Train] Loading OmniAvatar checkpoint: {omniavatar_ckpt}")
+            """
+            ckpt_sd : 
+            {
+                # LoRA adapters (for each of 40 blocks × 6 target modules)
+                "blocks.0.q.lora_A.weight": tensor([128, 5120]),
+                "blocks.0.q.lora_B.weight": tensor([5120, 128]),
+                "blocks.0.k.lora_A.weight": tensor([128, 5120]),
+                "blocks.0.k.lora_B.weight": tensor([5120, 128]),
+                "blocks.0.v.lora_A.weight": ...,
+                "blocks.0.o.lora_A.weight": ...,
+                "blocks.0.ffn.0.lora_A.weight": ...,
+                "blocks.0.ffn.2.lora_A.weight": ...,
+                ...
+                "blocks.39.ffn.2.lora_B.weight": ...,
+
+                # Audio modules
+                "audio_proj.weight": tensor([32, 43008]),     # AudioPack projection
+                "audio_proj.bias": tensor([32]),
+                "audio_proj_ln.weight": tensor([32]),          # AudioPack LayerNorm
+                "audio_proj_ln.bias": tensor([32]),
+                "audio_cond_projs.0.weight": tensor([5120, 32]),  # per-layer injection
+                "audio_cond_projs.0.bias": tensor([5120]),
+                ...
+                "audio_cond_projs.18.weight": tensor([5120, 32]),
+
+                # Patch embedding (33ch from OmniAvatar training)
+                "patch_embedding.weight": tensor([5120, 33, 1, 2, 2]),
+                "patch_embedding.bias": tensor([5120]),
+            }
+            """
             ckpt_sd = load_state_dict(omniavatar_ckpt)
             # Map LoRA keys: lora_A.weight → lora_A.default.weight
             mapped_sd = {}
@@ -380,16 +493,21 @@ class OmniAvatarV2VTrainingModule(nn.Module):
                     new_k = k.replace("lora_B.weight", "lora_B.default.weight")
                 mapped_sd[new_k] = v
 
-            # Handle patch_embedding expansion: 33ch → 49ch
+            # Handle patch_embedding expansion (e.g., 33ch→49ch or 49ch→65ch)
+            # New channels are zero-initialized so they have no initial contribution
             pe_key = "patch_embedding.weight"
             if pe_key in mapped_sd:
                 model_pe = self.pipe.dit.patch_embedding.weight
                 if mapped_sd[pe_key].shape != model_pe.shape:
+                    old_in_ch = mapped_sd[pe_key].shape[1]
+                    new_in_ch = model_pe.shape[1]
                     print(f"[Train] Expanding patch_embedding: {mapped_sd[pe_key].shape} → {model_pe.shape}")
-                    new_pe = model_pe.data.clone()
+                    new_pe = torch.zeros_like(model_pe.data)  # Zero-init, then paste old
                     slices = tuple(slice(0, s) for s in mapped_sd[pe_key].shape)
                     new_pe[slices] = mapped_sd[pe_key]
                     mapped_sd[pe_key] = new_pe
+                    print(f"[Train] Channels 0-{old_in_ch-1}: from checkpoint, "
+                          f"{old_in_ch}-{new_in_ch-1}: zero-initialized")
 
             pe_bias_key = "patch_embedding.bias"
             if pe_bias_key in mapped_sd and self.pipe.dit.patch_embedding.bias is not None:
@@ -556,18 +674,22 @@ class OmniAvatarV2VTrainingModule(nn.Module):
         mask_resized = F.interpolate(mask, size=(H_lat, W_lat), mode="bilinear", align_corners=False)
         return (mask_resized > 0.5).float().squeeze(0).squeeze(0)  # [H_lat, W_lat]
 
-    def prepare_v2v_input(self, ref_latent, masked_video_latents, latent_mask):
-        """Prepare 33-channel y tensor for V2V: ref_repeated + spatial_mask + masked_video.
+    def prepare_v2v_input(self, ref_latent, masked_video_latents, latent_mask,
+                          ref_sequence_latents=None):
+        """Prepare y tensor for V2V conditioning.
 
-        Note: The full 49ch input to the DiT is x (16ch noise) cat y (33ch), done in the DiT's
-        forward pass at wan_video_dit.py:357.
+        Without ref_sequence: 33ch = ref_repeated(16) + mask(1) + masked_video(16)
+        With ref_sequence:    49ch = ref_repeated(16) + mask(1) + masked_video(16) + ref_seq(16)
+
+        The full input to the DiT is x (16ch noise) cat y, done at wan_video_dit.py:395.
 
         Args:
             ref_latent: [1, 16, 1, H_lat, W_lat]
             masked_video_latents: [1, 16, T_lat, H_lat, W_lat]
             latent_mask: [H_lat, W_lat] (LatentSync: 1=keep, 0=mask)
+            ref_sequence_latents: [1, 16, T_lat, H_lat, W_lat] or None
         Returns:
-            y: [1, 33, T_lat, H_lat, W_lat]
+            y: [1, 33 or 49, T_lat, H_lat, W_lat]
         """
         T_lat = masked_video_latents.shape[2]
         H_lat, W_lat = masked_video_latents.shape[3], masked_video_latents.shape[4]
@@ -586,7 +708,11 @@ class OmniAvatarV2VTrainingModule(nn.Module):
             mask_ch[:, :, 0] = 0  # Frame 0: keep all (reference frame)
             mask_ch[:, :, 1:] = inverted[None, None, None]  # Frames 1+: spatial mask
 
-        return torch.cat([ref_repeated, mask_ch, masked_video_latents], dim=1)  # [1, 33, T, H, W]
+        parts = [ref_repeated, mask_ch, masked_video_latents]
+        if ref_sequence_latents is not None:
+            parts.append(ref_sequence_latents)  # [1, 16, T, H, W]
+
+        return torch.cat(parts, dim=1)
 
     # ------------------------------------------------------------------
     # Auxiliary losses (identical to train.py)
@@ -806,7 +932,25 @@ class OmniAvatarV2VTrainingModule(nn.Module):
             masked_video_latents = self.encode_video(data["masked_video"], device)
         self._log_vram("after-vae-encode")
 
-        # 5. Prepare V2V input (y = ref_repeated + spatial_mask + masked_video)
+        # 4b. Reference sequence latents (precomputed or live)
+        ref_sequence_latents = None
+        if self.use_ref_sequence:
+            if "precomputed_ref_sequence" in data:
+                ref_sequence_latents = data["precomputed_ref_sequence"].unsqueeze(0).to(
+                    dtype=self.dtype, device=device
+                )  # [1, 16, 21, 64, 64]
+            elif "ref_sequence_video" in data:
+                ref_sequence_latents = self.encode_video(data["ref_sequence_video"], device)
+                # Pad/trim temporal dim to match input_latents
+                T_target = input_latents.shape[2]
+                T_ref = ref_sequence_latents.shape[2]
+                if T_ref < T_target:
+                    pad = ref_sequence_latents[:, :, -1:].repeat(1, 1, T_target - T_ref, 1, 1)
+                    ref_sequence_latents = torch.cat([ref_sequence_latents, pad], dim=2)
+                elif T_ref > T_target:
+                    ref_sequence_latents = ref_sequence_latents[:, :, :T_target]
+
+        # 5. Prepare V2V input (y = ref_repeated + spatial_mask + masked_video [+ ref_sequence])
         ref_latent = input_latents[:, :, :1]
         latent_mask = self._get_latent_resolution_mask(input_latents)
         if latent_mask is not None:
@@ -814,7 +958,8 @@ class OmniAvatarV2VTrainingModule(nn.Module):
         else:
             H_lat, W_lat = input_latents.shape[3], input_latents.shape[4]
             latent_mask = torch.ones(H_lat, W_lat, device=device)
-        y = self.prepare_v2v_input(ref_latent, masked_video_latents, latent_mask)
+        y = self.prepare_v2v_input(ref_latent, masked_video_latents, latent_mask,
+                                   ref_sequence_latents=ref_sequence_latents)
 
         # 6. Sample noise + timestep
         noise = torch.randn_like(input_latents)
@@ -915,6 +1060,16 @@ def load_v2v_validation_data(val_dir, max_samples=4):
         print(f"[Validation] No video_square_path.txt found in {val_dir}")
         return []
 
+    """
+    video_dirs:
+    [
+        "/home/work/stableavatar_data/v2v_validation_data/recon/sample_001",
+        "/home/work/stableavatar_data/v2v_validation_data/recon/sample_002",
+        ...
+        "/home/work/stableavatar_data/v2v_validation_data/recon/sample_010",
+    ]
+
+    """
     with open(path_file) as f:
         video_dirs = [line.strip() for line in f if line.strip()]
 
@@ -948,6 +1103,12 @@ def load_v2v_validation_data(val_dir, max_samples=4):
             else:
                 sample["prompt"] = "a person is talking"
 
+            # Reference sequence latents (for --use_ref_sequence)
+            ref_path = os.path.join(vdir, "ref_latents.pt")
+            if os.path.exists(ref_path):
+                ref_data = torch.load(ref_path, map_location="cpu", weights_only=False)
+                sample["ref_sequence_latents"] = ref_data["ref_sequence_latents"]  # [16, 21, 64, 64]
+
             # Audio wav path (for muxing)
             wav_path = os.path.join(vdir, "audio.wav")
             if os.path.exists(wav_path):
@@ -962,6 +1123,19 @@ def load_v2v_validation_data(val_dir, max_samples=4):
 
     print(f"[Validation] Loaded {len(samples)} samples from {val_dir}")
     return samples
+"""
+sample[i]:
+  {
+      "input_latents": tensor([16, 21, 64, 64]),      # VAE-encoded source video (ground truth latents)
+      "masked_latents": tensor([16, 21, 64, 64]),      # source with mouth region masked out
+      "audio_emb": tensor([81, 10752]),                 # precomputed Wav2Vec2 features
+      "prompt": "a woman is talking with natural expressions",
+      "audio_wav_path": "/home/work/stableavatar_data/v2v_validation_data/recon/sample_001/audio.wav",
+      "video_dir": "/home/work/stableavatar_data/v2v_validation_data/recon/sample_001",
+      "name": "sample_001",
+  }
+"""
+
 
 
 @torch.no_grad()
@@ -1000,7 +1174,16 @@ def run_v2v_validation(model, sample, device, num_training_frames=81,
     else:
         H_lat, W_lat = input_latents.shape[3], input_latents.shape[4]
         latent_mask = torch.ones(H_lat, W_lat, device=device)
-    y = model.prepare_v2v_input(ref_latent, masked_video_latents, latent_mask)
+
+    # Reference sequence latents (if enabled and available)
+    ref_sequence_latents = None
+    if model.use_ref_sequence and "ref_sequence_latents" in sample:
+        ref_sequence_latents = sample["ref_sequence_latents"].unsqueeze(0).to(
+            dtype=model.dtype, device=device
+        )
+
+    y = model.prepare_v2v_input(ref_latent, masked_video_latents, latent_mask,
+                                ref_sequence_latents=ref_sequence_latents)
 
     # 5. Build "clean" latent for fixed-frame overwriting
     lat = torch.cat([
@@ -1217,8 +1400,9 @@ def save_checkpoint(accelerator, model, output_path, step_or_name, train_args):
         torch.save(state_dict, path)
         print(f"[Checkpoint] Saved {len(state_dict)} params to {path}")
 
+        in_dim = 65 if getattr(train_args, "use_ref_sequence", False) else 49
         config = {
-            "model_config": {"in_dim": 49, "audio_hidden_size": 32},
+            "model_config": {"in_dim": in_dim, "audio_hidden_size": 32},
             "train_architecture": "lora",
             "lora_rank": train_args.lora_rank,
             "lora_alpha": train_args.lora_alpha,
@@ -1228,6 +1412,7 @@ def save_checkpoint(accelerator, model, output_path, step_or_name, train_args):
             "i2v": True,
             "v2v": True,
             "random_prefix_frames": True,
+            "use_ref_sequence": getattr(train_args, "use_ref_sequence", False),
         }
         with open(os.path.join(output_path, "config.json"), "w") as f:
             json.dump(config, f, indent=4)
@@ -1724,6 +1909,8 @@ def train_parser():
                         help="Apply spatial mask to ALL frames including frame 0 (default: frame 0 unmasked)")
     parser.add_argument("--no_first_frame_overwrite", action="store_true", default=False,
                         help="Disable fixed-frame overwrite of frame 0 during validation denoising")
+    parser.add_argument("--use_ref_sequence", action="store_true", default=False,
+                        help="Concatenate reference sequence latents to V2V input (49ch → 65ch)")
     parser.add_argument("--num_frames", type=int, default=81)
     parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--width", type=int, default=512)
@@ -1856,6 +2043,12 @@ if __name__ == "__main__":
 
     set_seed(args.seed)
 
+    # Update in_dim on the EXISTING args singleton (must mutate, not replace,
+    # because wan_video_dit.py holds a direct import binding to the old object)
+    if args.use_ref_sequence:
+        args_module.args.model_config["in_dim"] = 65
+        print(f"[Config] Reference sequence enabled: in_dim=65 (49+16ch ref_sequence)")
+
     # Load LatentSync mask
     latentsync_mask = None
     if args.latentsync_mask_path and os.path.exists(args.latentsync_mask_path):
@@ -1863,7 +2056,7 @@ if __name__ == "__main__":
         mask_arr = np.array(mask_img)
         if mask_arr.ndim == 3:
             mask_arr = mask_arr[:, :, 0]
-        latentsync_mask = torch.from_numpy(mask_arr.astype(np.float32) / 255.0)
+        latentsync_mask = torch.from_numpy(mask_arr.astype(np.float32) / 255.0)         ## [256, 256]
         print(f"[Mask] Loaded LatentSync mask: {latentsync_mask.shape}")
 
     # Dataset
@@ -1878,6 +2071,7 @@ if __name__ == "__main__":
         use_precomputed_audio=args.use_precomputed_audio,
         use_precomputed_text_emb=args.use_precomputed_text_emb,
         mask_all_frames=args.mask_all_frames,
+        use_ref_sequence=args.use_ref_sequence,
     )
     print(f"[Dataset] {len(dataset)} samples (precomputed_vae={args.use_precomputed_vae}, precomputed_audio={args.use_precomputed_audio}, precomputed_text={args.use_precomputed_text_emb})")
 
@@ -1897,6 +2091,7 @@ if __name__ == "__main__":
         num_training_frames=args.num_frames,
         mask_all_frames=args.mask_all_frames,
         no_first_frame_overwrite=args.no_first_frame_overwrite,
+        use_ref_sequence=args.use_ref_sequence,
     )
 
     total = sum(p.numel() for p in model.parameters())

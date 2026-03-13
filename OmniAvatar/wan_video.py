@@ -126,12 +126,12 @@ class WanVideoPipeline(BasePipeline):
     def fetch_models(self, model_manager: ModelManager):
         text_encoder_model_and_path = model_manager.fetch_model("wan_video_text_encoder", require_model_path=True)
         if text_encoder_model_and_path is not None:
-            self.text_encoder, tokenizer_path = text_encoder_model_and_path
-            self.prompter.fetch_models(self.text_encoder)
+            self.text_encoder, tokenizer_path = text_encoder_model_and_path     ### WanTextEncoder from /home/work/.local/OmniAvatar/OmniAvatar/models/wan_video_text_encoder.py, "google/umt5-xxl"
+            self.prompter.fetch_models(self.text_encoder)     ### WanPrompter from /home/work/.local/OmniAvatar/OmniAvatar/prompters/wan_prompter.py  
             self.prompter.fetch_tokenizer(os.path.join(os.path.dirname(tokenizer_path), "google/umt5-xxl"))
-        self.dit = model_manager.fetch_model("wan_video_dit")
-        self.vae = model_manager.fetch_model("wan_video_vae")
-        self.image_encoder = model_manager.fetch_model("wan_video_image_encoder")
+        self.dit = model_manager.fetch_model("wan_video_dit")  ### WanModel from /home/work/.local/OmniAvatar/OmniAvatar/models/wan_video_dit.py
+        self.vae = model_manager.fetch_model("wan_video_vae")  ### WanVideoVAE from /home/work/.local/OmniAvatar/OmniAvatar/models/wan_video_vae.py
+        self.image_encoder = model_manager.fetch_model("wan_video_image_encoder")       ## None
 
 
     @staticmethod
