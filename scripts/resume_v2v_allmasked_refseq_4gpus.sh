@@ -2,6 +2,10 @@
 # Resume OmniAvatar V2V mask-all-frames + ref_sequence training from latest checkpoint.
 # Identical to train_v2v_auxloss_4gpu_allmasked_refseq.sh + --resume_from_checkpoint latest.
 # Wandb run continues automatically (reads wandb_id.txt from checkpoint).
+#
+# === 14B Training Lineage ===
+# Run 2 resume: maskall_refseq (resumes same wandb run)
+#   Output: /home/work/output_omniavatar_v2v_maskall_refseq/
 
 export TOKENIZERS_PARALLELISM=false
 

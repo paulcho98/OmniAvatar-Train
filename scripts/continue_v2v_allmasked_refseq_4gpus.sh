@@ -7,6 +7,12 @@
 #
 # For resuming the SAME run (same wandb run, same output dir), use:
 #   bash scripts/resume_v2v_allmasked_refseq_4gpus.sh
+#
+# === 14B Training Lineage ===
+# Run 3: new_data_loss_weights (this script)
+#   Source: maskall_refseq/step-1500.pt (run 2, cumulative 7000)
+#   Output: /home/work/output_omniavatar_v2v_maskall_refseq_new_data_loss_weights/ (3000 steps → cumulative 10000)
+#   Changes: added combined data (video_square_path_combined.txt), new loss weights
 
 if [ -z "$1" ]; then
     echo "Usage: $0 <checkpoint_path>"

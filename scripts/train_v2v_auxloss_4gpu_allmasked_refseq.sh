@@ -6,6 +6,12 @@
 #
 # 4 GPUs x grad_accum=2 = effective batch size of 8.
 # Input: 65ch (49ch base + 16ch reference sequence latents)
+#
+# === 14B Training Lineage ===
+# Run 2: maskall_refseq (this script)
+#   Source: auxloss/step-5500.pt (run 1, 5500 steps)
+#   Output: /home/work/output_omniavatar_v2v_maskall_refseq/ (1500 steps → cumulative 7000)
+#   Changes: added --mask_all_frames, --no_first_frame_overwrite, --use_ref_sequence
 
 if [ -z "$1" ]; then
     echo "Usage: $0 <checkpoint_path>"

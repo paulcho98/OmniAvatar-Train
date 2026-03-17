@@ -1,38 +1,41 @@
 #!/bin/bash
-# Continue OmniAvatar V2V mask-all-frames + ref_sequence training from a checkpoint
-# with a FRESH wandb run and updated loss weights + mouth_weight.
+# Continue OmniAvatar V2V training (fresh optimizer, fresh wandb).
+# 2-GPU variant with mouth_weight=2.0 and updated loss weights.
+# Uses trainable_weights.pt from the latest checkpoint dir (auto-detected).
 #
-# Usage: bash scripts/continue_v2v_allmasked_refseq_4gpus_new_weights.sh /path/to/step-XXXX.pt
+# No Accelerate --resume_from_checkpoint (4-GPU checkpoint incompatible with 2-GPU).
 #
 # === 14B Training Lineage ===
-# Run 4: new_data_loss_weights_mouth_weights (this script)
-#   Source: new_data_loss_weights/step-3000.pt (run 3, cumulative 10000)
-#   Output: /home/work/output_omniavatar_v2v_maskall_refseq_new_data_loss_weights_mouth_weights/ (1500 steps → cumulative 11500)
-#   Changes: aux_lpips_weight 0.1→0.15, added mouth_weight=2.0
+# Run 5: mouth_weight_2gpu (this script)
+#   Source: new_data_loss_weights_mouth_weights/checkpoint-1500/trainable_weights.pt (run 4, cumulative 11500)
+#   Output: /home/work/output_omniavatar_v2v_maskall_refseq_mouth_weight_2gpu/ (1500 steps → cumulative 13000)
+#   Changes: 4GPU→2GPU, gradient_accumulation_steps 2→4
 
-if [ -z "$1" ]; then
-    echo "Usage: $0 <checkpoint_path>"
-    echo "Example: $0 /home/work/output_omniavatar_v2v_maskall_refseq/step-2000.pt"
+OUTPUT_DIR=/home/work/output_omniavatar_v2v_maskall_refseq_new_data_loss_weights_mouth_weights
+
+# Auto-detect latest checkpoint
+LATEST_CKPT=$(ls -td "$OUTPUT_DIR"/checkpoint-* 2>/dev/null | head -1)
+if [ -z "$LATEST_CKPT" ]; then
+    echo "ERROR: No checkpoint found in $OUTPUT_DIR"
     exit 1
 fi
-
-CKPT_PATH="$1"
-
-# Extract step number from filename (e.g., step-5500.pt → 5500)
-STEP=$(basename "$CKPT_PATH" | grep -oP '\d+')
-if [ -z "$STEP" ]; then
-    STEP="unknown"
+CKPT_FILE="$LATEST_CKPT/trainable_weights.pt"
+if [ ! -f "$CKPT_FILE" ]; then
+    echo "ERROR: $CKPT_FILE not found"
+    exit 1
 fi
+STEP=$(basename "$LATEST_CKPT" | grep -oP '\d+')
+echo "Resuming from $CKPT_FILE (step $STEP)"
 
 export TOKENIZERS_PARALLELISM=false
 
-CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file configs/accelerate_4gpus.yaml \
+CUDA_VISIBLE_DEVICES=0,1 accelerate launch --config_file configs/accelerate_2gpus.yaml \
     scripts/train_v2v.py \
     --dit_paths "pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00001-of-00006.safetensors,pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00002-of-00006.safetensors,pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00003-of-00006.safetensors,pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00004-of-00006.safetensors,pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00005-of-00006.safetensors,pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00006-of-00006.safetensors" \
     --text_encoder_path pretrained_models/Wan2.1-T2V-14B/models_t5_umt5-xxl-enc-bf16.pth \
     --vae_path pretrained_models/Wan2.1-T2V-14B/Wan2.1_VAE.pth \
     --wav2vec_path pretrained_models/wav2vec2-base-960h \
-    --omniavatar_ckpt "$CKPT_PATH" \
+    --omniavatar_ckpt "$CKPT_FILE" \
     --data_list_path /home/work/stableavatar_data/v2v_training_data/video_square_path_combined.txt \
     --latentsync_mask_path /home/work/.local/Self-Forcing_LipSync_StableAvatar/diffsynth/utils/mask.png \
     --use_precomputed_vae \
@@ -41,14 +44,14 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file configs/accelerate_
     --num_frames 81 --height 512 --width 512 \
     --num_epochs 1000 \
     --learning_rate 5e-5 \
-    --gradient_accumulation_steps 2 \
+    --gradient_accumulation_steps 4 \
     --max_grad_norm 1 \
     --weight_decay 0.01 \
     --seed 42 \
     --use_gradient_checkpointing \
     --text_drop_prob 0.1 \
     --audio_drop_prob 0.1 \
-    --output_path /home/work/output_omniavatar_v2v_maskall_refseq_new_data_loss_weights_mouth_weights \
+    --output_path /home/work/output_omniavatar_v2v_maskall_refseq_mouth_weight_2gpu \
     --save_steps 500 \
     --use_sync_loss \
     --use_lpips_loss \
@@ -71,7 +74,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file configs/accelerate_
     --use_wandb \
     --wandb_entity "paulhcho" \
     --wandb_project "OmniAvatar-V2V" \
-    --wandb_run_name "v2v_14B_maskall_refseq_from${STEP}_from5500_new_data_loss_weights_from4500_mouth_weight" \
+    --wandb_run_name "v2v_14B_maskall_refseq_mouth_weight_2gpu_from${STEP}" \
     --wandb_log_every 1 \
     --compute_sync_metrics \
     --offload_frozen \
@@ -79,4 +82,3 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file configs/accelerate_
     --no_first_frame_overwrite \
     --use_ref_sequence \
     --wandb_api_key "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"
-    # --validate_at_start \

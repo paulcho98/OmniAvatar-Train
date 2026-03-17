@@ -1,28 +1,20 @@
 #!/bin/bash
-# Continue OmniAvatar V2V mask-all-frames + ref_sequence training from a checkpoint
-# with a FRESH wandb run and updated loss weights + mouth_weight.
-#
-# Usage: bash scripts/continue_v2v_allmasked_refseq_4gpus_new_weights.sh /path/to/step-XXXX.pt
+# Continue 14B V2V training: maskall + refseq + mouth_weight on 4 GPUs.
+# Fresh optimizer, fresh wandb.
 #
 # === 14B Training Lineage ===
-# Run 4: new_data_loss_weights_mouth_weights (this script)
-#   Source: new_data_loss_weights/step-3000.pt (run 3, cumulative 10000)
-#   Output: /home/work/output_omniavatar_v2v_maskall_refseq_new_data_loss_weights_mouth_weights/ (1500 steps → cumulative 11500)
-#   Changes: aux_lpips_weight 0.1→0.15, added mouth_weight=2.0
-
-if [ -z "$1" ]; then
-    echo "Usage: $0 <checkpoint_path>"
-    echo "Example: $0 /home/work/output_omniavatar_v2v_maskall_refseq/step-2000.pt"
-    exit 1
-fi
-
-CKPT_PATH="$1"
-
-# Extract step number from filename (e.g., step-5500.pt → 5500)
-STEP=$(basename "$CKPT_PATH" | grep -oP '\d+')
-if [ -z "$STEP" ]; then
-    STEP="unknown"
-fi
+# Run 6: mouth_weight_4gpu (this script)
+#   Source: mouth_weight_2gpu/step-1500.pt (run 5, cumulative 13000)
+#   Output: /home/work/output_omniavatar_v2v_maskall_refseq_mouth_weight_4gpu/
+#   Changes: 2GPU→4GPU, gradient_accumulation_steps 4→2
+#
+# Full lineage:
+#   Run 1: auxloss                         → 5500 steps  (cumulative  5500)
+#   Run 2: maskall_refseq                  → 1500 steps  (cumulative  7000)
+#   Run 3: new_data_loss_weights           → 3000 steps  (cumulative 10000)
+#   Run 4: new_data_loss_weights_mouth_wt  → 1500 steps  (cumulative 11500)
+#   Run 5: mouth_weight_2gpu              → 1500 steps  (cumulative 13000)
+#   Run 6: mouth_weight_4gpu (this)       → ...          (cumulative 13000+)
 
 export TOKENIZERS_PARALLELISM=false
 
@@ -32,7 +24,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file configs/accelerate_
     --text_encoder_path pretrained_models/Wan2.1-T2V-14B/models_t5_umt5-xxl-enc-bf16.pth \
     --vae_path pretrained_models/Wan2.1-T2V-14B/Wan2.1_VAE.pth \
     --wav2vec_path pretrained_models/wav2vec2-base-960h \
-    --omniavatar_ckpt "$CKPT_PATH" \
+    --omniavatar_ckpt /home/work/output_omniavatar_v2v_maskall_refseq_mouth_weight_2gpu/step-1500.pt \
     --data_list_path /home/work/stableavatar_data/v2v_training_data/video_square_path_combined.txt \
     --latentsync_mask_path /home/work/.local/Self-Forcing_LipSync_StableAvatar/diffsynth/utils/mask.png \
     --use_precomputed_vae \
@@ -48,7 +40,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file configs/accelerate_
     --use_gradient_checkpointing \
     --text_drop_prob 0.1 \
     --audio_drop_prob 0.1 \
-    --output_path /home/work/output_omniavatar_v2v_maskall_refseq_new_data_loss_weights_mouth_weights \
+    --output_path /home/work/output_omniavatar_v2v_maskall_refseq_mouth_weight_4gpu \
     --save_steps 500 \
     --use_sync_loss \
     --use_lpips_loss \
@@ -68,10 +60,11 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file configs/accelerate_
     --val_max_samples 4 \
     --val_num_inference_steps 25 \
     --validation_steps 500 \
+    --validate_at_start \
     --use_wandb \
     --wandb_entity "paulhcho" \
     --wandb_project "OmniAvatar-V2V" \
-    --wandb_run_name "v2v_14B_maskall_refseq_from${STEP}_from5500_new_data_loss_weights_from4500_mouth_weight" \
+    --wandb_run_name "v2v_14B_maskall_refseq_mouth_weight_4gpu_from13000" \
     --wandb_log_every 1 \
     --compute_sync_metrics \
     --offload_frozen \
@@ -79,4 +72,3 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file configs/accelerate_
     --no_first_frame_overwrite \
     --use_ref_sequence \
     --wandb_api_key "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"
-    # --validate_at_start \
