@@ -164,7 +164,9 @@ class OmniAvatarV2VDataset(torch.utils.data.Dataset):
         if self.use_precomputed_audio:
             audio_path = os.path.join(video_dir, "audio_emb_omniavatar.pt")
             audio_data = torch.load(audio_path, map_location="cpu")
-            result["precomputed_audio_emb"] = audio_data["audio_emb"]  # [total_frames, 10752]
+            emb = audio_data["audio_emb"]  # [total_frames, 10752]
+            # Truncate to training frames — source videos may be longer than num_frames
+            result["precomputed_audio_emb"] = emb[:self.num_frames]  # [num_frames, 10752]
 
         # Reference sequence latents
         if self.use_ref_sequence:
@@ -1583,6 +1585,11 @@ def batched_collate_fn(batch):
             # For text_emb [1, 512, 4096] -> squeeze leading 1 before stacking
             if key == "precomputed_text_emb":
                 values = [v.squeeze(0) if v.dim() == 3 and v.shape[0] == 1 else v for v in values]
+            # Audio embeddings may have different lengths (different source video durations).
+            # Truncate to the minimum length; forward() slices to num_training_frames anyway.
+            if key == "precomputed_audio_emb" and len(values) > 1:
+                min_len = min(v.shape[0] for v in values)
+                values = [v[:min_len] for v in values]
             result[key] = torch.stack(values, dim=0)
         else:
             result[key] = values
