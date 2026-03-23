@@ -687,24 +687,25 @@ class OmniAvatarV2VTrainingModule(nn.Module):
         The full input to the DiT is x (16ch noise) cat y, done at wan_video_dit.py:395.
 
         Args:
-            ref_latent: [1, 16, 1, H_lat, W_lat]
-            masked_video_latents: [1, 16, T_lat, H_lat, W_lat]
+            ref_latent: [B, 16, 1, H_lat, W_lat]
+            masked_video_latents: [B, 16, T_lat, H_lat, W_lat]
             latent_mask: [H_lat, W_lat] (LatentSync: 1=keep, 0=mask)
-            ref_sequence_latents: [1, 16, T_lat, H_lat, W_lat] or None
+            ref_sequence_latents: [B, 16, T_lat, H_lat, W_lat] or None
         Returns:
-            y: [1, 33 or 49, T_lat, H_lat, W_lat]
+            y: [B, 33 or 49, T_lat, H_lat, W_lat]
         """
+        B = masked_video_latents.shape[0]
         T_lat = masked_video_latents.shape[2]
         H_lat, W_lat = masked_video_latents.shape[3], masked_video_latents.shape[4]
         device = masked_video_latents.device
         dtype = masked_video_latents.dtype
 
-        ref_repeated = ref_latent.repeat(1, 1, T_lat, 1, 1)  # [1, 16, T, H, W]
+        ref_repeated = ref_latent.repeat(1, 1, T_lat, 1, 1)  # [B, 16, T, H, W]
 
         # OmniAvatar mask convention: 0=keep, 1=generate
         # Invert LatentSync (1=keep→0, 0=mask→1): mouth becomes 1 (generate)
         inverted = 1.0 - latent_mask  # [H_lat, W_lat]
-        mask_ch = torch.zeros(1, 1, T_lat, H_lat, W_lat, device=device, dtype=dtype)
+        mask_ch = torch.zeros(B, 1, T_lat, H_lat, W_lat, device=device, dtype=dtype)
         if self.mask_all_frames:
             mask_ch[:, :, :] = inverted[None, None, None]  # ALL frames: spatial mask
         else:
@@ -713,7 +714,7 @@ class OmniAvatarV2VTrainingModule(nn.Module):
 
         parts = [ref_repeated, mask_ch, masked_video_latents]
         if ref_sequence_latents is not None:
-            parts.append(ref_sequence_latents)  # [1, 16, T, H, W]
+            parts.append(ref_sequence_latents)  # [B, 16, T, H, W]
 
         return torch.cat(parts, dim=1)
 
@@ -876,75 +877,84 @@ class OmniAvatarV2VTrainingModule(nn.Module):
             self.dit.train()
         self._log_vram("forward-start")
 
-        # 1. Encode text (precomputed or live)
+        # 1. Encode text — batched by collate_fn: [B, 512, 4096]
         if "precomputed_text_emb" in data:
             context = data["precomputed_text_emb"].to(device, dtype=self.dtype)
-            # Ensure shape is [1, 512, 4096] — keep full padded length to match live path
             if context.dim() == 2:
                 context = context.unsqueeze(0)
         else:
             if self.offload_frozen:
                 self.text_encoder.to(device)
-            context = self.encode_text(data["prompt"], device)
+            prompts = data["prompt"] if isinstance(data["prompt"], list) else [data["prompt"]]
+            contexts = [self.encode_text(p, device) for p in prompts]
+            context = torch.cat(contexts, dim=0)  # [B, 512, 4096]
             if self.offload_frozen:
                 self.text_encoder.to("cpu")
                 torch.cuda.empty_cache()
         self._log_vram("after-text-encode")
 
-        # 2. Encode audio (precomputed or live)
+        B = context.shape[0]
+
+        # 2. Encode audio — batched by collate_fn: [B, total_frames, 10752]
         if "precomputed_audio_emb" in data:
-            full_emb = data["precomputed_audio_emb"]  # [total_frames, 10752]
-            audio_emb = full_emb[:self.num_training_frames]  # Slice to training frames
-            audio_emb = audio_emb.unsqueeze(0).to(dtype=self.dtype, device=device)
+            audio_emb = data["precomputed_audio_emb"].to(dtype=self.dtype, device=device)
+            audio_emb = audio_emb[:, :self.num_training_frames, :]  # [B, T, 10752]
         else:
             if self.offload_frozen:
                 self.wav2vec.to(device)
-            num_video_frames = len(data["video"])
-            audio_emb = self.encode_audio(data["audio"], num_video_frames, device)
-            audio_emb = audio_emb.to(dtype=self.dtype, device=device)
+            audios = data["audio"] if isinstance(data["audio"], list) else [data["audio"]]
+            num_video_frames = len(data["video"][0]) if isinstance(data["video"], list) else len(data["video"])
+            embs = [self.encode_audio(a, num_video_frames, device) for a in audios]
+            audio_emb = torch.cat(embs, dim=0).to(dtype=self.dtype, device=device)
             if self.offload_frozen:
                 self.wav2vec.to("cpu")
                 torch.cuda.empty_cache()
         self._log_vram("after-audio-encode")
 
-        # 3. Condition dropout
+        # 3. Condition dropout — per-sample within batch
         if self.training:
-            if self.text_drop_prob > 0 and random.random() < self.text_drop_prob:
-                if self._empty_text_cache is None:
-                    if self.offload_frozen:
-                        self.text_encoder.to(device)
-                    self._empty_text_cache = self.encode_text("", device)
-                    if self.offload_frozen:
-                        self.text_encoder.to("cpu")
-                        torch.cuda.empty_cache()
-                context = self._empty_text_cache.clone()
-            if self.audio_drop_prob > 0 and random.random() < self.audio_drop_prob:
-                audio_emb = torch.zeros_like(audio_emb)
+            if self.text_drop_prob > 0:
+                drop_mask = torch.rand(B) < self.text_drop_prob
+                if drop_mask.any():
+                    if self._empty_text_cache is None:
+                        if self.offload_frozen:
+                            self.text_encoder.to(device)
+                        self._empty_text_cache = self.encode_text("", device)
+                        if self.offload_frozen:
+                            self.text_encoder.to("cpu")
+                            torch.cuda.empty_cache()
+                    context[drop_mask] = self._empty_text_cache.squeeze(0).to(
+                        device=device, dtype=self.dtype)
+            if self.audio_drop_prob > 0:
+                drop_mask = torch.rand(B) < self.audio_drop_prob
+                if drop_mask.any():
+                    audio_emb[drop_mask] = 0
 
-        # 4. Encode video (precomputed or live)
+        # 4. VAE latents — batched by collate_fn: [B, 16, T, H, W]
         if "precomputed_input_latents" in data:
-            input_latents = data["precomputed_input_latents"].unsqueeze(0).to(
+            input_latents = data["precomputed_input_latents"].to(
                 dtype=self.dtype, device=device
             )
-            masked_video_latents = data["precomputed_masked_latents"].unsqueeze(0).to(
+            masked_video_latents = data["precomputed_masked_latents"].to(
                 dtype=self.dtype, device=device
             )
         else:
-            # VAE always on GPU (only 0.26 GB, needed for aux loss backward)
-            input_latents = self.encode_video(data["video"], device)
-            masked_video_latents = self.encode_video(data["masked_video"], device)
+            videos = data["video"] if isinstance(data["video"], list) else [data["video"]]
+            masked = data["masked_video"] if isinstance(data["masked_video"], list) else [data["masked_video"]]
+            input_latents = torch.cat([self.encode_video(v, device) for v in videos], dim=0)
+            masked_video_latents = torch.cat([self.encode_video(m, device) for m in masked], dim=0)
         self._log_vram("after-vae-encode")
 
-        # 4b. Reference sequence latents (precomputed or live)
+        # 4b. Reference sequence latents
         ref_sequence_latents = None
         if self.use_ref_sequence:
             if "precomputed_ref_sequence" in data:
-                ref_sequence_latents = data["precomputed_ref_sequence"].unsqueeze(0).to(
+                ref_sequence_latents = data["precomputed_ref_sequence"].to(
                     dtype=self.dtype, device=device
-                )  # [1, 16, 21, 64, 64]
+                )  # [B, 16, 21, 64, 64]
             elif "ref_sequence_video" in data:
-                ref_sequence_latents = self.encode_video(data["ref_sequence_video"], device)
-                # Pad/trim temporal dim to match input_latents
+                refs = data["ref_sequence_video"] if isinstance(data["ref_sequence_video"], list) else [data["ref_sequence_video"]]
+                ref_sequence_latents = torch.cat([self.encode_video(r, device) for r in refs], dim=0)
                 T_target = input_latents.shape[2]
                 T_ref = ref_sequence_latents.shape[2]
                 if T_ref < T_target:
@@ -953,8 +963,8 @@ class OmniAvatarV2VTrainingModule(nn.Module):
                 elif T_ref > T_target:
                     ref_sequence_latents = ref_sequence_latents[:, :, :T_target]
 
-        # 5. Prepare V2V input (y = ref_repeated + spatial_mask + masked_video [+ ref_sequence])
-        ref_latent = input_latents[:, :, :1]
+        # 5. Prepare V2V input
+        ref_latent = input_latents[:, :, :1]  # [B, 16, 1, H, W]
         latent_mask = self._get_latent_resolution_mask(input_latents)
         if latent_mask is not None:
             latent_mask = latent_mask.to(device=device)
@@ -964,59 +974,61 @@ class OmniAvatarV2VTrainingModule(nn.Module):
         y = self.prepare_v2v_input(ref_latent, masked_video_latents, latent_mask,
                                    ref_sequence_latents=ref_sequence_latents)
 
-        # 6. Sample noise + timestep
-        noise = torch.randn_like(input_latents)
+        # 6. Sample noise + per-sample timesteps
+        noise = torch.randn_like(input_latents)  # [B, 16, T, H, W]
         num_timesteps = len(self.scheduler.timesteps)
-        timestep_id = torch.randint(0, num_timesteps, (1,))
-        timestep = self.scheduler.timesteps[timestep_id].to(dtype=self.dtype, device=device)
+        timestep_ids = torch.randint(0, num_timesteps, (B,))  # [B]
+        timesteps = self.scheduler.timesteps[timestep_ids].to(dtype=self.dtype, device=device)
 
-        noisy_latents = self.scheduler.add_noise(input_latents, noise, timestep)
-        training_target = self.scheduler.training_target(input_latents, noise, timestep)
+        noisy_latents = self.scheduler.add_noise(input_latents, noise, timesteps)
+        training_target = self.scheduler.training_target(input_latents, noise, timesteps)
         self._log_vram("before-dit-forward")
 
         # 7. DiT forward
         noise_pred = self.dit(
-            x=noisy_latents, timestep=timestep, context=context, y=y,
+            x=noisy_latents, timestep=timesteps, context=context, y=y,
             audio_emb=audio_emb,
             use_gradient_checkpointing=self.use_gradient_checkpointing,
             use_gradient_checkpointing_offload=self.use_gradient_checkpointing_offload,
         )
         self._log_vram("after-dit-forward")
 
-        # 8. Flow matching MSE loss with spatial mask weighting + timestep weighting
+        # 8. Loss: per-element MSE → spatial weight → per-sample mean → timestep weight → batch mean
+        loss_per_element = F.mse_loss(
+            noise_pred.float(), training_target.float(), reduction='none'
+        )  # [B, 16, T, H, W]
+
         if self.mouth_weight != 1.0 and self.latentsync_mask is not None:
-            # Per-element MSE (no reduction) for spatial weighting
-            loss_per_element = F.mse_loss(
-                noise_pred.float(), training_target.float(), reduction='none'
-            )
-            # loss_per_element: [1, 16, T_lat, H_lat, W_lat]
-
-            # Build weight map from latent-resolution mask
-            # latent_mask: [H_lat, W_lat], 1.0=keep (upper face), 0.0=mouth
-            latent_mask = self._get_latent_resolution_mask(noise_pred)
-            latent_mask = latent_mask.to(device=device)
-            mouth_indicator = 1.0 - latent_mask  # 1.0=mouth, 0.0=keep
-            # weight_map: mouth_weight in mouth, 1.0 outside
+            latent_mask_w = self._get_latent_resolution_mask(noise_pred)
+            latent_mask_w = latent_mask_w.to(device=device)
+            mouth_indicator = 1.0 - latent_mask_w
             weight_map = mouth_indicator * (self.mouth_weight - 1.0) + 1.0
-            # Expand to [1, 1, 1, H_lat, W_lat] for broadcasting
-            weight_map = weight_map[None, None, None]
-
-            loss = (loss_per_element * weight_map).mean()
+            weight_map = weight_map[None, None, None]  # [1, 1, 1, H, W]
+            loss_per_element = loss_per_element * weight_map
             self._last_unweighted_mse = loss_per_element.mean().detach()
         else:
-            loss = F.mse_loss(noise_pred.float(), training_target.float())
             self._last_unweighted_mse = None
-        loss = loss * self.scheduler.training_weight(timestep)
 
-        # 9. Auxiliary losses on decoded x_0
+        # Per-sample mean, then per-sample timestep weight, then batch mean
+        per_sample_loss = loss_per_element.mean(dim=(1, 2, 3, 4))  # [B]
+        per_sample_weight = self.scheduler.training_weight(timesteps)  # [B]
+        per_sample_weight = per_sample_weight.to(device=device, dtype=per_sample_loss.dtype)
+        loss = (per_sample_loss * per_sample_weight).mean()  # scalar
+
+        # 9. Auxiliary losses on decoded x_0 (batch_size=1 only)
         T_lat = input_latents.shape[2]
         use_any_aux = (self.syncnet is not None or self.lpips_func is not None
                        or self.trepa_func is not None)
         if use_any_aux:
+            if B > 1:
+                raise RuntimeError(
+                    f"Auxiliary losses do not support batch_size > 1 (got {B}). "
+                    f"Use --batch_size 1 with aux losses."
+                )
             self._log_vram("before-aux-losses")
             mse_loss_val = loss.detach()  # Save before combining
 
-            sigma = self.scheduler.sigmas[timestep_id].to(
+            sigma = self.scheduler.sigmas[timestep_ids[0]].to(
                 device=device, dtype=noise_pred.dtype
             )
             sync_len = self.aux_num_frames if self.aux_num_frames > 0 else T_lat
@@ -1547,6 +1559,37 @@ def load_training_state(accelerator, model, optimizer, lr_scheduler, ckpt_dir):
 
 
 # ============================================================================
+# Collate
+# ============================================================================
+
+
+def batched_collate_fn(batch):
+    """Collate samples into a batched dict.
+
+    Tensor fields are stacked along a new batch dimension.
+    String/other fields are collected into lists.
+    None samples are filtered out.
+    """
+    batch = [b for b in batch if b is not None]
+    if not batch:
+        return None
+
+    result = {}
+    for key in batch[0]:
+        values = [s[key] for s in batch if key in s]
+        if not values:
+            continue
+        if isinstance(values[0], torch.Tensor):
+            # For text_emb [1, 512, 4096] -> squeeze leading 1 before stacking
+            if key == "precomputed_text_emb":
+                values = [v.squeeze(0) if v.dim() == 3 and v.shape[0] == 1 else v for v in values]
+            result[key] = torch.stack(values, dim=0)
+        else:
+            result[key] = values
+    return result
+
+
+# ============================================================================
 # Training Loop
 # ============================================================================
 
@@ -1563,12 +1606,8 @@ def launch_training(dataset, model, args):
     )
     lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
 
-    def collate_fn(batch):
-        batch = [b for b in batch if b is not None]
-        return batch[0] if batch else None
-
     dataloader = torch.utils.data.DataLoader(
-        dataset, batch_size=1, shuffle=True, collate_fn=collate_fn,
+        dataset, batch_size=args.batch_size, shuffle=True, collate_fn=batched_collate_fn,
         num_workers=args.num_workers,
         pin_memory=True,
         persistent_workers=(args.num_workers > 0),
@@ -1954,6 +1993,8 @@ def train_parser():
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--num_epochs", type=int, default=1)
+    parser.add_argument("--batch_size", type=int, default=1,
+                        help="Training batch size per GPU (default: 1)")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--use_gradient_checkpointing", action="store_true", default=False)
     parser.add_argument("--use_gradient_checkpointing_offload", action="store_true", default=False)
