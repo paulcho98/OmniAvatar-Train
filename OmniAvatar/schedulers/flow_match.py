@@ -68,8 +68,8 @@ class FlowMatchScheduler():
             diffs = (self.timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs()  # [B, N]
             timestep_ids = diffs.argmin(dim=1)  # [B]
             sigma = self.sigmas[timestep_ids]  # [B]
-            # Move to same device as samples, reshape for broadcasting: [B] -> [B, 1, 1, 1, 1]
-            sigma = sigma.to(original_samples.device)
+            # Move to same device/dtype as samples, reshape for broadcasting: [B] -> [B, 1, 1, 1, 1]
+            sigma = sigma.to(device=original_samples.device, dtype=original_samples.dtype)
             while sigma.dim() < original_samples.dim():
                 sigma = sigma.unsqueeze(-1)
         else:
