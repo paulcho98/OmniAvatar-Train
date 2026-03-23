@@ -288,6 +288,9 @@ class Head(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
 
     def forward(self, x, t_mod):
+        # t_mod: [B, dim] -> [B, 1, dim] for broadcasting with modulation [1, 2, dim]
+        if t_mod.dim() == 2:
+            t_mod = t_mod.unsqueeze(1)
         shift, scale = (self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(2, dim=1)
         x = (self.head(self.norm(x) * (1 + scale) + shift))
         return x
@@ -390,7 +393,7 @@ class WanModel(torch.nn.Module):
             audio_emb = torch.cat([audio_emb[:, :, :1].repeat(1, 1, 3, 1, 1), audio_emb], 2) # 1, 768, 44, 1, 1
             audio_emb = self.audio_proj(audio_emb)
 
-            audio_emb = torch.concat([audio_cond_proj(audio_emb) for audio_cond_proj in self.audio_cond_projs], 0)
+            audio_emb = torch.stack([audio_cond_proj(audio_emb) for audio_cond_proj in self.audio_cond_projs], dim=1)
 
         x = torch.cat([x, y], dim=1)
         x = self.patch_embedding(x)
@@ -424,7 +427,7 @@ class WanModel(torch.nn.Module):
                     x = torch.cat([x, torch.zeros_like(x[:, -1:]).repeat(1, pad_size, 1)], 1)
                 x = torch.chunk(x, sp_size, dim=1)[get_sequence_parallel_rank()]
 
-            audio_emb = audio_emb.reshape(x.shape[0], audio_emb.shape[0] // x.shape[0], -1, *audio_emb.shape[2:])
+            # audio_emb is already [B, num_projs, C, T, 1, 1] from torch.stack(..., dim=1)
                 
             for layer_i, block in enumerate(self.blocks):
                 # audio cond
