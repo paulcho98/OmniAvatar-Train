@@ -62,8 +62,18 @@ class FlowMatchScheduler():
     def add_noise(self, original_samples, noise, timestep):
         if isinstance(timestep, torch.Tensor):
             timestep = timestep.cpu()
-        timestep_id = torch.argmin((self.timesteps - timestep).abs())
-        sigma = self.sigmas[timestep_id]
+        # Handle batched timesteps: [B] or scalar
+        if isinstance(timestep, torch.Tensor) and timestep.dim() >= 1 and timestep.shape[0] > 1:
+            # Per-sample sigma: find closest timestep index for each element
+            diffs = (self.timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs()  # [B, N]
+            timestep_ids = diffs.argmin(dim=1)  # [B]
+            sigma = self.sigmas[timestep_ids]  # [B]
+            # Reshape for broadcasting: [B] -> [B, 1, 1, 1, 1]
+            while sigma.dim() < original_samples.dim():
+                sigma = sigma.unsqueeze(-1)
+        else:
+            timestep_id = torch.argmin((self.timesteps - timestep).abs())
+            sigma = self.sigmas[timestep_id]
         sample = (1 - sigma) * original_samples + sigma * noise
         return sample
     
@@ -74,6 +84,13 @@ class FlowMatchScheduler():
     
 
     def training_weight(self, timestep):
-        timestep_id = torch.argmin((self.timesteps - timestep.to(self.timesteps.device)).abs())
-        weights = self.linear_timesteps_weights[timestep_id]
+        ts_device = self.timesteps.device
+        timestep = timestep.to(ts_device) if isinstance(timestep, torch.Tensor) else torch.tensor(timestep, device=ts_device)
+        if timestep.dim() >= 1 and timestep.shape[0] > 1:
+            diffs = (self.timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs()  # [B, N]
+            timestep_ids = diffs.argmin(dim=1)  # [B]
+            weights = self.linear_timesteps_weights[timestep_ids]  # [B]
+        else:
+            timestep_id = torch.argmin((self.timesteps - timestep).abs())
+            weights = self.linear_timesteps_weights[timestep_id]
         return weights
