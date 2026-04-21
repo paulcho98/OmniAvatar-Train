@@ -40,7 +40,7 @@ VARIANTS = {
     },
 }
 
-TRAJ_DIR = "/home/work/.local/ode_full_trajectories/14B"
+TRAJ_DIR = "/home/work/.local/ode_full_trajectories/14B_audio_only_cfg"
 
 
 def load_schedule():
