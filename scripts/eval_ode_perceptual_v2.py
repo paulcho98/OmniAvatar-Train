@@ -373,8 +373,13 @@ def _extract_mouth_landmarks(image_bgr, detector, predictor):
 
 
 # -- SyncNet --
-def compute_syncnet(video_with_audio_path, device):
-    """Run SyncNet on a video with muxed audio. Returns (sync_d, sync_c) or None."""
+def compute_syncnet(video_with_audio_path, device, min_track=50):
+    """Run SyncNet on a video with muxed audio. Returns (sync_d, sync_c) or None.
+
+    min_track: minimum number of consecutive frames with a detected face for a valid
+    face track. Default 50 works for 81-frame OmniAvatar videos. LatentSync produces
+    16-frame videos → need min_track <= 15.
+    """
     sys.path.insert(0, METRICS_ROOT)
     from eval.syncnet import SyncNetEval
     from eval.syncnet_detect import SyncNetDetector
@@ -387,7 +392,7 @@ def compute_syncnet(video_with_audio_path, device):
 
     try:
         detector = SyncNetDetector(device=device, detect_results_dir=detect_dir)
-        detector(video_path=video_with_audio_path, min_track=50)
+        detector(video_path=video_with_audio_path, min_track=min_track)
 
         crop_dir = os.path.join(detect_dir, "crop")
         if not os.path.exists(crop_dir) or not os.listdir(crop_dir):
@@ -454,10 +459,15 @@ def run_metrics(args):
 
     # CSV
     shard_suffix = f"_shard{args.shard_id}" if args.shard_id is not None else ""
-    csv_path = os.path.join(args.output_dir, f"metrics{shard_suffix}.csv")
+    if args.sync_only:
+        # Append-only sync output; filename differs so we don't clobber existing metrics.csv.
+        csv_path = os.path.join(args.output_dir, f"metrics_sync_only{shard_suffix}.csv")
+    else:
+        csv_path = os.path.join(args.output_dir, f"metrics{shard_suffix}.csv")
     csv_file = open(csv_path, "w", newline="")
     writer = csv.writer(csv_file)
     writer.writerow(["step", "t", "sample", "metric", "region", "value"])
+    sync_min_track = args.sync_min_track
 
     t_start = time.time()
 
@@ -471,8 +481,9 @@ def run_metrics(args):
         gt_tensor = frames_to_tensor(gt_bgr)
 
         # GT baselines (sharpness, SyncNet) — written with step=-1
-        gt_sharp = compute_mouth_sharpness(gt_bgr, mouth_bbox)
-        writer.writerow([-1, "gt", sample_name, "sharpness", "mouth", f"{gt_sharp:.4f}"])
+        if not args.sync_only:
+            gt_sharp = compute_mouth_sharpness(gt_bgr, mouth_bbox)
+            writer.writerow([-1, "gt", sample_name, "sharpness", "mouth", f"{gt_sharp:.4f}"])
 
         gt_audio_path = os.path.join(sample_vid_dir, "gt_audio.mp4")
         if os.path.exists(gt_audio_path):
@@ -482,7 +493,7 @@ def run_metrics(args):
                 detector_sync = SyncNetDetector(
                     device=str(device), detect_results_dir=detect_dir
                 )
-                detector_sync(video_path=gt_audio_path, min_track=50)
+                detector_sync(video_path=gt_audio_path, min_track=sync_min_track)
                 crop_dir = os.path.join(detect_dir, "crop")
                 if os.path.exists(crop_dir) and os.listdir(crop_dir):
                     sd_list, sc_list = [], []
@@ -514,39 +525,40 @@ def run_metrics(args):
             step_path = os.path.join(sample_vid_dir, f"step_{step_i:03d}.mp4")
             step_audio_path = step_path.replace(".mp4", "_audio.mp4")
 
-            pred_bgr = read_video_frames(step_path)
-            pred_tensor = frames_to_tensor(pred_bgr)
+            if not args.sync_only:
+                pred_bgr = read_video_frames(step_path)
+                pred_tensor = frames_to_tensor(pred_bgr)
 
-            T = min(pred_tensor.shape[0], gt_tensor.shape[0])
-            pred_t = pred_tensor[:T]
-            gt_t = gt_tensor[:T]
-            pred_b = pred_bgr[:T]
-            gt_b = gt_bgr[:T]
+                T = min(pred_tensor.shape[0], gt_tensor.shape[0])
+                pred_t = pred_tensor[:T]
+                gt_t = gt_tensor[:T]
+                pred_b = pred_bgr[:T]
+                gt_b = gt_bgr[:T]
 
-            # -- Pixel MSE --
-            for region, mask in [("mouth", mouth_mask), ("upper_face", upper_mask), ("full", full_mask)]:
-                v = compute_masked_mse(pred_t, gt_t, mask)
-                writer.writerow([step_i, f"{t_val:.6f}", sample_name, "pixel_mse", region, f"{v:.8f}"])
+                # -- Pixel MSE --
+                for region, mask in [("mouth", mouth_mask), ("upper_face", upper_mask), ("full", full_mask)]:
+                    v = compute_masked_mse(pred_t, gt_t, mask)
+                    writer.writerow([step_i, f"{t_val:.6f}", sample_name, "pixel_mse", region, f"{v:.8f}"])
 
-            # -- SSIM --
-            for region, mask in [("mouth", mouth_mask), ("upper_face", upper_mask), ("full", full_mask)]:
-                v = compute_masked_ssim(pred_t, gt_t, mask)
-                writer.writerow([step_i, f"{t_val:.6f}", sample_name, "ssim", region, f"{v:.8f}"])
+                # -- SSIM --
+                for region, mask in [("mouth", mouth_mask), ("upper_face", upper_mask), ("full", full_mask)]:
+                    v = compute_masked_ssim(pred_t, gt_t, mask)
+                    writer.writerow([step_i, f"{t_val:.6f}", sample_name, "ssim", region, f"{v:.8f}"])
 
-            # -- LPIPS --
-            lp_mouth = compute_lpips(lpips_model, pred_t, gt_t, mouth_bbox, device)
-            writer.writerow([step_i, f"{t_val:.6f}", sample_name, "lpips", "mouth", f"{lp_mouth:.8f}"])
-            lp_full = compute_lpips_full(lpips_model, pred_t, gt_t, device)
-            writer.writerow([step_i, f"{t_val:.6f}", sample_name, "lpips", "full", f"{lp_full:.8f}"])
+                # -- LPIPS --
+                lp_mouth = compute_lpips(lpips_model, pred_t, gt_t, mouth_bbox, device)
+                writer.writerow([step_i, f"{t_val:.6f}", sample_name, "lpips", "mouth", f"{lp_mouth:.8f}"])
+                lp_full = compute_lpips_full(lpips_model, pred_t, gt_t, device)
+                writer.writerow([step_i, f"{t_val:.6f}", sample_name, "lpips", "full", f"{lp_full:.8f}"])
 
-            # -- Sharpness --
-            sharp = compute_mouth_sharpness(pred_b, mouth_bbox)
-            writer.writerow([step_i, f"{t_val:.6f}", sample_name, "sharpness", "mouth", f"{sharp:.4f}"])
+                # -- Sharpness --
+                sharp = compute_mouth_sharpness(pred_b, mouth_bbox)
+                writer.writerow([step_i, f"{t_val:.6f}", sample_name, "sharpness", "mouth", f"{sharp:.4f}"])
 
-            # -- LMD --
-            lmd = compute_video_lmd(pred_b, gt_b, dlib_detector, dlib_predictor)
-            if lmd is not None:
-                writer.writerow([step_i, f"{t_val:.6f}", sample_name, "lmd", "mouth", f"{lmd:.6f}"])
+                # -- LMD --
+                lmd = compute_video_lmd(pred_b, gt_b, dlib_detector, dlib_predictor)
+                if lmd is not None:
+                    writer.writerow([step_i, f"{t_val:.6f}", sample_name, "lmd", "mouth", f"{lmd:.6f}"])
 
             # -- SyncNet --
             if os.path.exists(step_audio_path):
@@ -556,7 +568,7 @@ def run_metrics(args):
                     detector_sync = SyncNetDetector(
                         device=str(device), detect_results_dir=detect_dir
                     )
-                    detector_sync(video_path=step_audio_path, min_track=50)
+                    detector_sync(video_path=step_audio_path, min_track=sync_min_track)
                     crop_dir = os.path.join(detect_dir, "crop")
                     if os.path.exists(crop_dir) and os.listdir(crop_dir):
                         sync_d_list, sync_c_list = [], []
@@ -771,6 +783,12 @@ def main():
                         help="LatentSync mask path (required for metrics phase)")
     parser.add_argument("--shard_id", type=int, default=None)
     parser.add_argument("--num_shards", type=int, default=None)
+    parser.add_argument("--sync_min_track", type=int, default=50,
+                        help="Min frames for SyncNet face track. Lower for short videos "
+                             "(e.g. 15 for 16-frame LatentSync).")
+    parser.add_argument("--sync_only", action="store_true",
+                        help="Compute ONLY SyncNet sync_c/sync_d (skip pixel_mse/ssim/lpips/lmd/sharpness). "
+                             "Writes to metrics_sync_only.csv so existing metrics.csv is preserved.")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
