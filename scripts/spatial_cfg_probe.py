@@ -112,13 +112,13 @@ def teacher_predict_x0(teacher, x_t, t_val, condition, neg_condition, cfg):
 
 
 def compute_region_diff(diff_hw, mask_512):
-    """Given a 2D diff map [H,W] and a binary [H,W] mask (1=mouth, 0=upper_face),
-    return dict of region means."""
-    mouth = mask_512.bool()
-    uf = ~mouth
+    """Given a 2D diff map [H,W] and the LatentSync mask [H,W] (1=upper_face
+    preserved, 0=mouth generated), return dict of region means."""
+    is_upper = mask_512.astype(bool)
+    is_mouth = ~is_upper
     return {
-        "mouth":      float(diff_hw[mouth].mean()),
-        "upper_face": float(diff_hw[uf].mean()),
+        "mouth":      float(diff_hw[is_mouth].mean()),
+        "upper_face": float(diff_hw[is_upper].mean()),
         "full":       float(diff_hw.mean()),
     }
 
