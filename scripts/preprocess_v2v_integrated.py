@@ -285,10 +285,15 @@ def load_and_prepare_video(video_dir, mask_binary, args):
         )
         gt_tensor = torch.from_numpy(gt_frames).permute(3, 0, 1, 2)  # [3, T, H, W]
 
-        # Masked frames (ALL frames masked, including frame 0)
+        # Masked frames
         masked_tensor = gt_tensor.clone()
         mask_2d = mask_binary.view(1, 1, height, width)
-        masked_tensor *= mask_2d
+        if args.legacy_twostep_mask:
+            # Legacy: leave frame 0 unmasked, mask frames 1+ only.
+            # Frame 0 is re-encoded separately in process_batch.
+            masked_tensor[:, 1:] *= mask_2d
+        else:
+            masked_tensor *= mask_2d
 
         # Reference segment
         if total_frames >= 2 * num_frames:
@@ -406,6 +411,19 @@ def process_batch(valid_items, vae, wav2vec, feature_extractor, device, dtype, a
 
         input_latents_batch = batch_vae_encode(vae, gt_batch, device, dtype)
         masked_latents_batch = batch_vae_encode(vae, masked_batch, device, dtype)
+
+        if args.legacy_twostep_mask:
+            # Re-encode frame 0 with masking applied, then splice into position 0.
+            # masked_batch has frame 0 unmasked; we need it masked for the splice.
+            mask_2d = torch.from_numpy(
+                cv2.resize(
+                    (cv2.imread(args.latentsync_mask_path, cv2.IMREAD_GRAYSCALE).astype(np.float32) / 255.0),
+                    (args.width, args.height), interpolation=cv2.INTER_LINEAR,
+                )
+            ).gt(0.5).float()
+            frame0_batch = gt_batch[:, :, :1] * mask_2d[None, None, None, :, :]  # [B, 3, 1, H, W]
+            frame0_latents = batch_vae_encode(vae, frame0_batch, device, dtype)   # [B, 16, 1, H, W]
+            masked_latents_batch[:, :, :1] = frame0_latents
     else:
         input_latents_batch = None
         masked_latents_batch = None
@@ -746,6 +764,11 @@ def parse_args():
     # Flags
     parser.add_argument("--force", action="store_true",
                         help="Re-process even if all files exist")
+    parser.add_argument("--legacy_twostep_mask", action="store_true",
+                        help="Replicate the original two-step masking pipeline: encode "
+                             "with frame 0 unmasked, then re-encode frame 0 separately "
+                             "with masking and splice it in. Produces identical latents "
+                             "to the precompute_vae_latents_nomask + masked scripts.")
     parser.add_argument("--skip_gpu", action="store_true",
                         help="Only do Phase 1 (directory setup), skip GPU encoding")
     parser.add_argument("--also_save_vae_latents", action="store_true",
