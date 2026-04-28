@@ -308,6 +308,16 @@ def main() -> None:
         prompt_to_path = encode_unique_prompts(
             shard_prompts, pipe, args.output_dir, args.device
         )
+
+        # Also generate the empty-string negative embedding used for CFG.
+        # Saved as neg_text_emb.pt in output_dir (matches the teacher's
+        # text_drop_prob=0.1 unconditional signal from OmniAvatar training).
+        neg_emb_path = os.path.join(args.output_dir, "neg_text_emb.pt")
+        if not os.path.exists(neg_emb_path):
+            neg_emb = encode_prompt(pipe, "", args.device)  # [1, 512, 4096] fp32
+            torch.save(neg_emb.to(torch.bfloat16), neg_emb_path)
+            print(f"[main] Saved neg_text_emb.pt (empty-string encoding) to {neg_emb_path}")
+
         # Release GPU memory after encoding.
         pipe.text_encoder.to("cpu")
         del pipe
